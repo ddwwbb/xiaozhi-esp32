@@ -114,6 +114,10 @@ bool DeviceStateMachine::TransitionTo(DeviceState new_state) {
     }
 
     // Validate transition
+    // 非法转换只记 warn 并返回 false，不抛异常也不强制切换。
+    // 设计意图：设备状态机由多个事件源（网络/音频/用户按键）异步驱动，
+    // 某条事件路径触发非法转换属偶发，强制切换或抛异常会让设备进入更难恢复的状态。
+    // 调用方据返回值决定后续动作（Application::SetDeviceState 直接透传该 bool）。
     if (!IsValidTransition(old_state, new_state)) {
         ESP_LOGW(TAG, "Invalid state transition: %s -> %s",
                  GetStateName(old_state), GetStateName(new_state));
@@ -146,6 +150,9 @@ void DeviceStateMachine::RemoveStateChangeListener(int listener_id) {
 }
 
 void DeviceStateMachine::NotifyStateChange(DeviceState old_state, DeviceState new_state) {
+    // 关键：在 mutex 内拷贝回调列表，然后在 mutex 外无锁调用。
+    // 若回调在持锁期间执行，回调内一旦再次加锁（如注册/移除 listener）就会死锁。
+    // 拷贝快照后释放锁，允许回调安全地操作状态机本身。
     std::vector<StateCallback> callbacks_copy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -154,7 +161,7 @@ void DeviceStateMachine::NotifyStateChange(DeviceState old_state, DeviceState ne
             callbacks_copy.push_back(cb);
         }
     }
-    
+
     for (const auto& cb : callbacks_copy) {
         cb(old_state, new_state);
     }

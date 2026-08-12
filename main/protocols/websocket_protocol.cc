@@ -77,10 +77,14 @@ void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
 }
 
 bool WebsocketProtocol::OpenAudioChannel() {
+    // 从 NVS settings 读取 OTA 响应下发的 websocket 配置。
+    // 这些值由 ota.cc 解析 OTA 响应后写入（见 docs/10-OTA激活与检查链路.md）。
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
     int version = settings.GetInt("version");
+    // version!=0 表示 OTA 响应显式下发了协议版本，覆盖固件默认 v1。
+    // 个人部署后端默认下发 v3（紧凑帧），见 ServerAddressProvider.getWebsocketProtocolVersion。
     if (version != 0) {
         version_ = version;
     }
@@ -96,11 +100,16 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     if (!token.empty()) {
         // If token not has a space, add "Bearer " prefix
+        // 兼容两种形态：裸 token（加 Bearer 前缀）或已含 scheme 的 token（原样使用）
         if (token.find(" ") == std::string::npos) {
             token = "Bearer " + token;
         }
         websocket_->SetHeader("Authorization", token.c_str());
     }
+    // 握手必需 Header：
+    //   Protocol-Version —— 后端据此解析二进制帧格式（1/2/3），非法则关闭连接
+    //   Device-Id        —— 后端识别设备、绑定会话的唯一标识（MAC）
+    //   Client-Id        —— 板 UUID，用于审计与会话归属
     websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
     websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
@@ -178,7 +187,9 @@ bool WebsocketProtocol::OpenAudioChannel() {
         return false;
     }
 
-    // Wait for server hello
+    // Wait for server hello：阻塞等待服务端 hello 响应，10 秒超时。
+    // 握手未完成前不认为音频通道已打开，避免在协议未协商时收发音频。
+    // 服务端 hello 由 ParseServerHello 置位 SERVER_HELLO_EVENT。
     EventBits_t bits =
         xEventGroupWaitBits(event_group_handle_, WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT, pdTRUE,
                             pdFALSE, pdMS_TO_TICKS(10000));
@@ -196,14 +207,21 @@ bool WebsocketProtocol::OpenAudioChannel() {
 }
 
 std::string WebsocketProtocol::GetHelloMessage() {
+    // hello 消息：向服务端声明本设备协议版本、能力与音频参数。
+    // 后端 WebSocketHandler.handleHelloMessage 据此：
+    //   1. 回复 hello（含服务端 audio_params=Opus）
+    //   2. 检测 features.mcp=true 则异步初始化设备 MCP 工具（见 docs/12-MCP设备控制链路.md）
     // keys: message type, version, audio_params (format, sample_rate, channels)
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "type", "hello");
     cJSON_AddNumberToObject(root, "version", version_);
     cJSON* features = cJSON_CreateObject();
 #if CONFIG_USE_SERVER_AEC
+    // 仅在固件编译启用 CONFIG_USE_SERVER_AEC 时声明 aec 能力。
+    // BOX2 等板型默认未启用，hello 不含 aec 字段，后端无需处理 v2 timestamp。
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
+    // mcp 恒为 true：当前所有设备控制统一走 MCP（legacy type:"iot" 已废弃）。
     cJSON_AddBoolToObject(features, "mcp", true);
     cJSON_AddItemToObject(root, "features", features);
     AddTextFontCapabilities(root);

@@ -44,6 +44,12 @@ Ota::~Ota() {
 }
 
 std::string Ota::GetCheckVersionUrl() {
+    // OTA 端点解析：settings(wifi).ota_url 优先，否则回落 CONFIG_OTA_URL。
+    // CONFIG_OTA_URL 出厂默认指向官方云 https://api.tenclass.net/xiaozhi/ota/。
+    // 【个人部署】通过 settings 写入本地 server 地址覆盖，例如
+    //   http://192.168.1.10:8091/api/device/ota
+    // 即可让设备激活与版本检查指向自建后端，无需改固件重刷。
+    // 后端实现见 docs/10-OTA激活与检查链路.md。
     Settings settings("wifi", false);
     std::string url = settings.GetString("ota_url");
     if (url.empty()) {
@@ -143,6 +149,8 @@ esp_err_t Ota::CheckVersion() {
         }
     }
 
+    // ===== OTA 响应五段解析：每段独立，缺省走 else 仅日志，不影响其他段 =====
+    // 个人部署后端按需返回 activation/websocket/server_time，可安全省略 mqtt/firmware 段。
     has_mqtt_config_ = false;
     cJSON *mqtt = cJSON_GetObjectItem(root, "mqtt");
     if (cJSON_IsObject(mqtt)) {
@@ -161,6 +169,8 @@ esp_err_t Ota::CheckVersion() {
         }
         has_mqtt_config_ = true;
     } else {
+        // 个人部署不部署 EMQX/MQTT 时走到这里：仅记录日志，设备无主动推送能力，
+        // 但 OTA 与对话主链路不受影响。
         ESP_LOGI(TAG, "No mqtt section found !");
     }
 

@@ -14,24 +14,37 @@ struct AudioStreamPacket {
     std::vector<uint8_t> payload;
 };
 
+// ===== WebSocket 二进制音频帧结构（跨端字节级契约）=====
+// 字节序：网络字节序（大端）。发送端用 htons/htonl 编码，接收端用 ntohs/ntohl 解码。
+// 后端 xiaozhi-dialogue WebSocketBinaryProtocol.java 必须与本结构逐字节对齐。
+// 详见 docs/02-固件协议规范总览.md §2.3。
+//
+// 版本演进：
+//   v1 = 裸 Opus payload，无头部（向后兼容最老固件）
+//   v2 = 16 字节头，带 timestamp（服务端 AEC 需要，payload_size 为 32 位）
+//   v3 = 4 字节紧凑头，默认版本（payload_size 为 16 位，单帧最大 65535）
 struct BinaryProtocol2 {
     uint16_t version;
     uint16_t type;          // Message type (0: OPUS, 1: JSON)
     uint32_t reserved;      // Reserved for future use
     uint32_t timestamp;     // Timestamp in milliseconds (used for server-side AEC)
-    uint32_t payload_size;  // Payload size in bytes
+    uint32_t payload_size;  // Payload size in bytes（32 位，v2 独有）
     uint8_t payload[];      // Payload data
 } __attribute__((packed));
 
 struct BinaryProtocol3 {
-    uint8_t type;
-    uint8_t reserved;
-    uint16_t payload_size;
+    uint8_t type;           // 0: OPUS（v3 仅支持 Opus）
+    uint8_t reserved;       // Reserved
+    uint16_t payload_size;  // Payload size in bytes（16 位，故单帧 ≤ 65535）
     uint8_t payload[];
 } __attribute__((packed));
 
 enum AbortReason { kAbortReasonNone, kAbortReasonWakeWordDetected };
 
+// 监听模式：决定 VAD 静音后是否自动结束本轮、是否支持实时全双工。
+//   AutoStop    —— 检测到静音自动结束（默认，无需 AEC）
+//   ManualStop  —— 用户显式停止才结束（按钮长按场景）
+//   Realtime    —— 实时全双工，边说边听，必须 AEC 支持否则自激
 enum ListeningMode {
     kListeningModeAutoStop,
     kListeningModeManualStop,
