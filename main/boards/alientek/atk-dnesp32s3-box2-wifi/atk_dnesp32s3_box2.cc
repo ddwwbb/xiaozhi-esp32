@@ -70,8 +70,8 @@ private:
         std::string last_refresh;        // Token 最近刷新（显示子串）
         bool unavailable = false;
         bool disabled = false;
-        long success_total = 0;
-        long failed_total = 0;
+        long success_total = -1;  // -1 = 无此数据（直连模式）
+        long failed_total = -1;
         std::vector<std::pair<int, int>> buckets;  // 20×10min 桶：成功/失败
         // api-call wham/usage 查询结果
         int remaining_5h = -1;
@@ -92,6 +92,9 @@ private:
     std::vector<AccountDetail> usage_details_;
     int usage_cooling_ = 0;
     int usage_detail_index_ = -1;
+    // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
+    esp_timer_handle_t usage_refresh_timer_ = nullptr;
+    int pending_detail_restore_ = -1;
 
     // 用量查询配置：NVS（vendor 命名空间）优先，Kconfig 为出厂默认
     struct CliproxyConfig {
@@ -107,6 +110,41 @@ private:
         cfg.management_key = settings.GetString("cliproxy_management_key", CONFIG_CLIPROXY_USAGE_MANAGEMENT_KEY);
         cfg.provider = settings.GetString("cliproxy_provider", CONFIG_CLIPROXY_USAGE_PROVIDER);
         return cfg;
+    }
+
+    // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 CPA 格式的 codex auth json
+    static std::string CodexAuthKey(int index) {
+        return "codex_auth_" + std::to_string(index + 1);
+    }
+
+    std::vector<std::string> LoadDirectAuthJsons() {
+        std::vector<std::string> jsons;
+        Settings settings("vendor");
+        int count = settings.GetInt("codex_auth_count", 0);
+        for (int i = 0; i < count && i < 8; i++) {
+            std::string json = settings.GetString(CodexAuthKey(i), "");
+            if (!json.empty()) {
+                jsons.push_back(std::move(json));
+            }
+        }
+        return jsons;
+    }
+
+    void SaveDirectAuthJsons(const std::vector<std::string>& jsons) {
+        Settings settings("vendor", true);
+        int old_count = settings.GetInt("codex_auth_count", 0);
+        for (int i = (int)jsons.size(); i < old_count; i++) {
+            settings.EraseKey(CodexAuthKey(i));
+        }
+        for (size_t i = 0; i < jsons.size(); i++) {
+            settings.SetString(CodexAuthKey((int)i), jsons[i]);
+        }
+        settings.SetInt("codex_auth_count", (int)jsons.size());
+    }
+
+    int GetUsageRefreshMinutes() {
+        Settings settings("vendor");
+        return settings.GetInt("usage_refresh_minutes", 0);
     }
 
     void InitializeBoardPowerManager() {
@@ -246,28 +284,193 @@ private:
         return UrlDecode(body.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
     }
 
-    static esp_err_t UsageConfigGetHandler(httpd_req_t* req) {
+    static std::string GetConfigPage() {
         auto cfg = instance_->GetCliproxyConfig();
-        char page[1024];
-        snprintf(page, sizeof(page),
+        int refresh_minutes = instance_->GetUsageRefreshMinutes();
+
+        std::string page =
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>用量查询配置</title></head>"
-            "<body style=\"font-family:sans-serif;max-width:480px;margin:40px auto\">"
+            "<body style=\"font-family:sans-serif;max-width:520px;margin:24px auto\">"
             "<h2>ChatGPT 用量查询配置</h2>"
-            "<form method=\"POST\" action=\"/save\">"
-            "<p>CLIProxyAPI 地址<br><input name=\"base_url\" value=\"%s\" style=\"width:100%%\" "
-            "placeholder=\"http://192.168.1.10:8317\"></p>"
-            "<p>Management Key<br><input name=\"management_key\" style=\"width:100%%\" "
-            "placeholder=\"留空表示不修改\"></p>"
-            "<p>Provider 过滤<br><input name=\"provider\" value=\"%s\" style=\"width:100%%\" "
-            "placeholder=\"codex\"></p>"
-            "<p><button type=\"submit\">保存</button></p>"
-            "<p><small>留空的字段保持不变；保存后设备自动退出配置模式。</small></p>"
-            "</form></body></html>",
-            cfg.base_url.c_str(), cfg.provider.c_str());
+            "<h3>直连账号（优先，无需 CPA）</h3>";
+
+        auto jsons = instance_->LoadDirectAuthJsons();
+        if (jsons.empty()) {
+            page += "<p><small>尚未导入账号令牌。把 CPA 的 auths/*.json 内容粘贴到下面导入，"
+                    "设备将直连官方接口查询用量并自动刷新令牌。</small></p>";
+        } else {
+            for (size_t i = 0; i < jsons.size(); i++) {
+                cJSON* root = cJSON_Parse(jsons[i].c_str());
+                std::string email = "未知账号";
+                if (root != nullptr) {
+                    cJSON* email_item = cJSON_GetObjectItem(root, "email");
+                    if (cJSON_IsString(email_item)) {
+                        email = email_item->valuestring;
+                    }
+                    cJSON_Delete(root);
+                }
+                page += "<form method=\"POST\" action=\"/delete\" style=\"margin:2px 0\">"
+                        "<input type=\"hidden\" name=\"index\" value=\"" + std::to_string(i) + "\">"
+                        "<button type=\"submit\" style=\"width:100%;text-align:left\">" +
+                        std::to_string(i + 1) + ". " + email + "  [删除]</button></form>";
+            }
+        }
+
+        page += "<form method=\"POST\" action=\"/import\">"
+                "<textarea name=\"auth_json\" rows=\"5\" style=\"width:100%\" "
+                "placeholder=\"粘贴 CPA 令牌文件内容（auths/*.json，需含 refresh_token）\"></textarea>"
+                "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 8 个</small></p>"
+                "</form>"
+
+                "<h3>CPA 中转（无直连账号时的回退）</h3>"
+                "<form method=\"POST\" action=\"/save\">"
+                "<p>CLIProxyAPI 地址<br><input name=\"base_url\" value=\"" + cfg.base_url +
+                "\" style=\"width:100%\" placeholder=\"http://192.168.1.10:8317\"></p>"
+                "<p>Management Key<br><input name=\"management_key\" style=\"width:100%\" "
+                "placeholder=\"留空表示不修改\"></p>"
+                "<p>Provider 过滤<br><input name=\"provider\" value=\"" + cfg.provider +
+                "\" style=\"width:100%\" placeholder=\"codex\"></p>"
+
+                "<h3>自动刷新</h3>"
+                "<p>间隔分钟（0=关闭，面板 15 秒自动关闭；大于 0 时面板常驻并按此间隔自动刷新）<br>"
+                "<input name=\"refresh_minutes\" type=\"number\" min=\"0\" max=\"1440\" value=\"" +
+                std::to_string(refresh_minutes) + "\" style=\"width:120px\"></p>"
+                "<p><button type=\"submit\">保存</button></p>"
+                "<p><small>保存后设备自动退出配置模式；导入/删除账号不退出，可连续操作。</small></p>"
+                "</form></body></html>";
+        return page;
+    }
+
+    static esp_err_t UsageConfigGetHandler(httpd_req_t* req) {
+        std::string page = GetConfigPage();
         httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send(req, page.c_str(), HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    static void SendSimplePage(httpd_req_t* req, const std::string& body, const char* back_text) {
+        std::string page = "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                           "<meta http-equiv=\"refresh\" content=\"2;url=/\"></head><body>" +
+                           body + "<p><a href=\"/\">" + back_text + "</a></p></body></html>";
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, page.c_str(), HTTPD_RESP_USE_STRLEN);
+    }
+
+    // 从已存令牌 JSON 提取 account_id（去重用）
+    static std::string ExtractAccountId(const std::string& json) {
+        cJSON* root = cJSON_Parse(json.c_str());
+        if (root == nullptr) {
+            return "";
+        }
+        cJSON* item = cJSON_GetObjectItem(root, "account_id");
+        std::string account_id = cJSON_IsString(item) ? item->valuestring : "";
+        if (account_id.empty()) {
+            cJSON* id_token = cJSON_GetObjectItem(root, "id_token");
+            if (cJSON_IsString(id_token)) {
+                cJSON* payload = DecodeJwtPayload(id_token->valuestring);
+                cJSON* auth = payload ? cJSON_GetObjectItem(payload, "https://api.openai.com/auth") : nullptr;
+                cJSON* account_item = auth ? cJSON_GetObjectItem(auth, "chatgpt_account_id") : nullptr;
+                if (cJSON_IsString(account_item)) {
+                    account_id = account_item->valuestring;
+                }
+                cJSON_Delete(payload);
+            }
+        }
+        cJSON_Delete(root);
+        return account_id;
+    }
+
+    static esp_err_t UsageConfigImportHandler(httpd_req_t* req) {
+        if (req->content_len > 16384) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large");
+            return ESP_FAIL;
+        }
+        std::vector<char> buf(req->content_len + 1, 0);
+        int received = httpd_req_recv(req, buf.data(), req->content_len);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        std::string auth_json = GetFormField(std::string(buf.data(), received), "auth_json");
+
+        cJSON* root = cJSON_Parse(auth_json.c_str());
+        if (root == nullptr) {
+            SendSimplePage(req, "<h3>导入失败：不是有效的 JSON</h3>", "返回");
+            return ESP_OK;
+        }
+        cJSON* refresh_item = cJSON_GetObjectItem(root, "refresh_token");
+        if (!cJSON_IsString(refresh_item) || refresh_item->valuestring[0] == '\0') {
+            cJSON_Delete(root);
+            SendSimplePage(req, "<h3>导入失败：缺少 refresh_token 字段</h3>", "返回");
+            return ESP_OK;
+        }
+
+        // account_id 缺失时从 id_token JWT 提取
+        std::string account_id = ExtractAccountId(auth_json);
+        if (account_id.empty()) {
+            cJSON_Delete(root);
+            SendSimplePage(req, "<h3>导入失败：无法确定 account_id</h3>", "返回");
+            return ESP_OK;
+        }
+        cJSON* account_item = cJSON_GetObjectItem(root, "account_id");
+        if (cJSON_IsString(account_item)) {
+            cJSON_ReplaceItemInObject(root, "account_id", cJSON_CreateString(account_id.c_str()));
+        } else {
+            cJSON_AddStringToObject(root, "account_id", account_id.c_str());
+        }
+
+        auto jsons = instance_->LoadDirectAuthJsons();
+        int replace_index = -1;
+        for (size_t i = 0; i < jsons.size(); i++) {
+            if (ExtractAccountId(jsons[i]) == account_id) {
+                replace_index = (int)i;
+                break;
+            }
+        }
+        if (replace_index < 0 && jsons.size() >= 8) {
+            cJSON_Delete(root);
+            SendSimplePage(req, "<h3>导入失败：最多 8 个账号</h3>", "返回");
+            return ESP_OK;
+        }
+
+        char* printed = cJSON_PrintUnformatted(root);
+        if (printed == nullptr) {
+            cJSON_Delete(root);
+            SendSimplePage(req, "<h3>导入失败：序列化错误</h3>", "返回");
+            return ESP_OK;
+        }
+        if (replace_index >= 0) {
+            jsons[replace_index] = printed;
+        } else {
+            jsons.push_back(printed);
+        }
+        cJSON_free(printed);
+        cJSON_Delete(root);
+        instance_->SaveDirectAuthJsons(jsons);
+
+        SendSimplePage(req, "<h3>已导入，当前共 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
+        return ESP_OK;
+    }
+
+    static esp_err_t UsageConfigDeleteHandler(httpd_req_t* req) {
+        char body[128] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        int index = atoi(GetFormField(body, "index").c_str());
+        auto jsons = instance_->LoadDirectAuthJsons();
+        if (index < 0 || index >= (int)jsons.size()) {
+            SendSimplePage(req, "<h3>删除失败：索引无效</h3>", "返回");
+            return ESP_OK;
+        }
+        jsons.erase(jsons.begin() + index);
+        instance_->SaveDirectAuthJsons(jsons);
+        SendSimplePage(req, "<h3>已删除，剩余 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
         return ESP_OK;
     }
 
@@ -283,6 +486,7 @@ private:
         auto base_url = GetFormField(body, "base_url");
         auto management_key = GetFormField(body, "management_key");
         auto provider = GetFormField(body, "provider");
+        auto refresh_minutes = GetFormField(body, "refresh_minutes");
 
         Settings settings("vendor", true);
         if (!base_url.empty()) {
@@ -293,6 +497,12 @@ private:
         }
         if (!provider.empty()) {
             settings.SetString("cliproxy_provider", provider);
+        }
+        if (!refresh_minutes.empty()) {
+            int minutes = atoi(refresh_minutes.c_str());
+            if (minutes < 0) minutes = 0;
+            if (minutes > 1440) minutes = 1440;
+            settings.SetInt("usage_refresh_minutes", minutes);
         }
         settings.SetString("cliproxy_configured", "1");
 
@@ -367,6 +577,18 @@ private:
         save_uri.handler = UsageConfigSaveHandler;
         httpd_register_uri_handler(usage_config_server_, &save_uri);
 
+        httpd_uri_t import_uri = {};
+        import_uri.uri = "/import";
+        import_uri.method = HTTP_POST;
+        import_uri.handler = UsageConfigImportHandler;
+        httpd_register_uri_handler(usage_config_server_, &import_uri);
+
+        httpd_uri_t delete_uri = {};
+        delete_uri.uri = "/delete";
+        delete_uri.method = HTTP_POST;
+        delete_uri.handler = UsageConfigDeleteHandler;
+        httpd_register_uri_handler(usage_config_server_, &delete_uri);
+
         if (usage_config_exit_timer_ == nullptr) {
             esp_timer_create_args_t timer_args = {
                 .callback = [](void* arg) { instance_->ExitUsageConfigMode(); },
@@ -409,8 +631,79 @@ private:
         return cJSON_IsTrue(item);
     }
 
+    // 直连官方接口模式：使用配置页导入的 CPA 格式令牌；401 时自动刷新并重试
+    void QueryDirectUsage() {
+        std::vector<std::string> jsons = LoadDirectAuthJsons();
+        std::vector<AccountDetail> details;
+        int ok_count = 0;
+
+        for (size_t i = 0; i < jsons.size(); i++) {
+            cJSON* root = cJSON_Parse(jsons[i].c_str());
+            if (root == nullptr) {
+                continue;
+            }
+            auto get_str = [&root](const char* key) -> std::string {
+                cJSON* item = cJSON_GetObjectItem(root, key);
+                return cJSON_IsString(item) ? item->valuestring : "";
+            };
+
+            AccountDetail acc;
+            acc.email = get_str("email");
+            acc.account_id = get_str("account_id");
+            FillDetailFromIdToken(acc, get_str("id_token"));
+            std::string last_refresh = get_str("last_refresh");
+            if (last_refresh.size() > 5) {
+                acc.last_refresh = last_refresh.substr(5, 11);
+            }
+            size_t at = acc.email.find('@');
+            acc.name = at != std::string::npos ? acc.email.substr(0, at) : acc.email;
+            if (acc.name.empty()) {
+                acc.name = "账号" + std::to_string(i + 1);
+            }
+            if (acc.name.size() > 16) {
+                acc.name.resize(16);
+            }
+
+            std::string access_token = get_str("access_token");
+            int status = -1;
+            if (!access_token.empty() && !acc.account_id.empty()) {
+                status = DirectFetchUsage(access_token, acc.account_id, acc);
+            }
+            if (status == 401) {
+                // access_token 过期：OAuth 刷新（新令牌已回写 NVS）后重试一次
+                std::string new_token = RefreshCodexToken(root, (int)i);
+                if (!new_token.empty()) {
+                    status = DirectFetchUsage(new_token, acc.account_id, acc);
+                }
+            }
+            if (status == 200) {
+                ok_count++;
+            } else if (status == 400 || status == 401 || status == 403) {
+                acc.unavailable = true;
+            }
+            cJSON_Delete(root);
+            details.push_back(std::move(acc));
+        }
+
+        if (details.empty() || ok_count == 0) {
+            HideUsagePanel();
+            GetDisplay()->ShowNotification("直连查询失败:令牌失效或无法访问chatgpt.com", 4000);
+            return;
+        }
+        ShowUsageListPanel(std::move(details), 0);
+    }
+
     void QueryChatGptUsage() {
         auto display = GetDisplay();
+        pending_detail_restore_ = usage_detail_index_;
+
+        // 直连模式优先：导入了账号令牌就不依赖 CPA
+        if (!LoadDirectAuthJsons().empty()) {
+            ShowUsagePanelLoading();
+            QueryDirectUsage();
+            return;
+        }
+
         CliproxyConfig cfg = GetCliproxyConfig();
         const std::string& base_url = cfg.base_url;
         const std::string& management_key = cfg.management_key;
@@ -696,6 +989,196 @@ private:
         return acc.remaining_5h >= 0 || acc.remaining_weekly >= 0;
     }
 
+    static bool Base64UrlDecode(const std::string& in, std::string& out) {
+        auto value_of = [](char c) -> int {
+            if (c >= 'A' && c <= 'Z') return c - 'A';
+            if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+            if (c >= '0' && c <= '9') return c - '0' + 52;
+            if (c == '-' || c == '+') return 62;
+            if (c == '_' || c == '/') return 63;
+            return -1;
+        };
+        out.clear();
+        out.reserve(in.size() * 3 / 4 + 3);
+        int val = 0, valb = -8;
+        for (char c : in) {
+            int v = value_of(c);
+            if (v < 0) {
+                continue;  // 跳过 '=' 填充与非法字符
+            }
+            val = (val << 6) + v;
+            valb += 6;
+            if (valb >= 0) {
+                out.push_back((char)((val >> valb) & 0xFF));
+                valb -= 8;
+            }
+        }
+        return !out.empty();
+    }
+
+    // 解开 id_token(JWT) payload，提取 email/exp 与 https://api.openai.com/auth 嵌套声明
+    static cJSON* DecodeJwtPayload(const std::string& jwt) {
+        size_t p1 = jwt.find('.');
+        size_t p2 = jwt.find('.', p1 == std::string::npos ? 0 : p1 + 1);
+        if (p1 == std::string::npos || p2 == std::string::npos || p2 <= p1 + 1) {
+            return nullptr;
+        }
+        std::string payload;
+        if (!Base64UrlDecode(jwt.substr(p1 + 1, p2 - p1 - 1), payload)) {
+            return nullptr;
+        }
+        return cJSON_Parse(payload.c_str());
+    }
+
+    static std::string JwtString(cJSON* payload, const char* key) {
+        cJSON* item = payload ? cJSON_GetObjectItem(payload, key) : nullptr;
+        return cJSON_IsString(item) ? item->valuestring : "";
+    }
+
+    // 用 id_token 填充账号展示信息（套餐/订阅/账号ID），字段名与 CPA jwt_parser 一致
+    void FillDetailFromIdToken(AccountDetail& acc, const std::string& id_token) {
+        cJSON* payload = DecodeJwtPayload(id_token);
+        if (payload == nullptr) {
+            return;
+        }
+        if (acc.email.empty()) {
+            acc.email = JwtString(payload, "email");
+        }
+        cJSON* auth = cJSON_GetObjectItem(payload, "https://api.openai.com/auth");
+        if (auth != nullptr) {
+            cJSON* account_item = cJSON_GetObjectItem(auth, "chatgpt_account_id");
+            if (acc.account_id.empty() && cJSON_IsString(account_item)) {
+                acc.account_id = account_item->valuestring;
+            }
+            cJSON* plan_item = cJSON_GetObjectItem(auth, "chatgpt_plan_type");
+            if (acc.plan.empty() && cJSON_IsString(plan_item)) {
+                acc.plan = plan_item->valuestring;
+            }
+            cJSON* until_item = cJSON_GetObjectItem(auth, "chatgpt_subscription_active_until");
+            if (cJSON_IsString(until_item)) {
+                acc.subscription_until = std::string(until_item->valuestring).substr(0, 10);
+            }
+        }
+        cJSON_Delete(payload);
+    }
+
+    // 直连官方接口 GET chatgpt.com/backend-api/wham/usage；返回 HTTP 状态码，200 时填充 acc
+    static int DirectFetchUsage(const std::string& access_token, const std::string& account_id,
+                                AccountDetail& acc) {
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
+        http->SetTimeout(10000);
+        http->SetHeader("Authorization", "Bearer " + access_token);
+        http->SetHeader("Content-Type", "application/json");
+        http->SetHeader("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal");
+        http->SetHeader("Chatgpt-Account-Id", account_id);
+        if (!http->Open("GET", "https://chatgpt.com/backend-api/wham/usage")) {
+            ESP_LOGE(TAG, "Direct usage: open failed, err=0x%x", http->GetLastError());
+            return -1;
+        }
+        int status = http->GetStatusCode();
+        std::string body = status == 200 ? http->ReadAll() : "";
+        http->Close();
+        if (status != 200) {
+            ESP_LOGE(TAG, "Direct usage: HTTP %d (%s)", status, acc.name.c_str());
+            return status;
+        }
+
+        cJSON* usage = cJSON_Parse(body.c_str());
+        if (usage == nullptr) {
+            return -2;
+        }
+        cJSON* plan_item = cJSON_GetObjectItem(usage, "plan_type");
+        if (cJSON_IsString(plan_item) && acc.plan.empty()) {
+            acc.plan = plan_item->valuestring;
+        }
+        cJSON* rate_limit = cJSON_GetObjectItem(usage, "rate_limit");
+        cJSON* primary = rate_limit ? cJSON_GetObjectItem(rate_limit, "primary_window") : nullptr;
+        cJSON* secondary = rate_limit ? cJSON_GetObjectItem(rate_limit, "secondary_window") : nullptr;
+        cJSON* cr_limit = cJSON_GetObjectItem(usage, "code_review_rate_limit");
+        cJSON* cr_primary = cr_limit ? cJSON_GetObjectItem(cr_limit, "primary_window") : nullptr;
+        acc.remaining_5h = WindowRemainingPct(primary);
+        acc.remaining_weekly = WindowRemainingPct(secondary);
+        acc.remaining_cr = WindowRemainingPct(cr_primary);
+        acc.reset_5h = WindowResetSeconds(primary);
+        acc.reset_weekly = WindowResetSeconds(secondary);
+        acc.reset_cr = WindowResetSeconds(cr_primary);
+        cJSON_Delete(usage);
+        ESP_LOGI(TAG, "Direct usage: %s 5h=%d%% weekly=%d%% cr=%d%%",
+                 acc.name.c_str(), acc.remaining_5h, acc.remaining_weekly, acc.remaining_cr);
+        return 200;
+    }
+
+    // OAuth 刷新令牌（端点与参数同 CPA），成功后把新令牌回写 NVS 并返回新 access_token
+    static std::string RefreshCodexToken(cJSON* auth_json, int slot_index) {
+        cJSON* refresh_item = cJSON_GetObjectItem(auth_json, "refresh_token");
+        if (!cJSON_IsString(refresh_item) || refresh_item->valuestring[0] == '\0') {
+            return "";
+        }
+        std::string body = "grant_type=refresh_token"
+                           "&client_id=app_EMoamEEZ73f0CkXaXp7hrann"
+                           "&refresh_token=" + std::string(refresh_item->valuestring) +
+                           "&scope=openid%20profile%20email";
+
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
+        http->SetTimeout(10000);
+        http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
+        http->SetHeader("Accept", "application/json");
+        http->SetContent(std::move(body));
+        if (!http->Open("POST", "https://auth.openai.com/oauth/token")) {
+            ESP_LOGE(TAG, "Token refresh: open failed, err=0x%x", http->GetLastError());
+            return "";
+        }
+        int status = http->GetStatusCode();
+        std::string resp = status == 200 ? http->ReadAll() : "";
+        http->Close();
+        if (status != 200) {
+            ESP_LOGE(TAG, "Token refresh: HTTP %d", status);
+            return "";
+        }
+
+        cJSON* token = cJSON_Parse(resp.c_str());
+        if (token == nullptr) {
+            return "";
+        }
+        cJSON* access_item = cJSON_GetObjectItem(token, "access_token");
+        if (!cJSON_IsString(access_item)) {
+            cJSON_Delete(token);
+            return "";
+        }
+
+        // 回写：access/refresh/id token 都可能轮换，必须全部更新并持久化
+        auto replace_string = [auth_json](const char* key, cJSON* value_root) {
+            cJSON* value = value_root ? cJSON_GetObjectItem(value_root, key) : nullptr;
+            if (cJSON_IsString(value)) {
+                cJSON_ReplaceItemInObject(auth_json, key, cJSON_CreateString(value->valuestring));
+            }
+        };
+        replace_string("access_token", token);
+        replace_string("refresh_token", token);
+        replace_string("id_token", token);
+
+        time_t now = time(nullptr);
+        char time_str[24];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+        cJSON_ReplaceItemInObject(auth_json, "last_refresh", cJSON_CreateString(time_str));
+        cJSON* expires_item = cJSON_GetObjectItem(token, "expires_in");
+        if (cJSON_IsNumber(expires_item)) {
+            time_t expired_at = now + expires_item->valueint;
+            strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&expired_at));
+            cJSON_ReplaceItemInObject(auth_json, "expired", cJSON_CreateString(time_str));
+        }
+        cJSON_Delete(token);
+
+        char* printed = cJSON_PrintUnformatted(auth_json);
+        if (printed != nullptr) {
+            Settings settings("vendor", true);
+            settings.SetString(CodexAuthKey(slot_index), printed);
+            cJSON_free(printed);
+        }
+        ESP_LOGI(TAG, "Token refreshed for slot %d", slot_index + 1);
+        return access_item->valuestring;
+    }
+
     static lv_color_t UsageBarColor(int remaining_pct) {
         if (remaining_pct < 0) {
             return lv_color_hex(0x5F6368);
@@ -713,6 +1196,9 @@ private:
         if (usage_panel_timer_ != nullptr) {
             esp_timer_stop(usage_panel_timer_);
         }
+        if (usage_refresh_timer_ != nullptr) {
+            esp_timer_stop(usage_refresh_timer_);
+        }
         usage_detail_index_ = -1;
         if (usage_panel_ == nullptr) {
             return;
@@ -720,6 +1206,21 @@ private:
         DisplayLockGuard lock(GetDisplay());
         lv_obj_delete(usage_panel_);
         usage_panel_ = nullptr;
+    }
+
+    // 配置了自动刷新间隔时面板常驻（12 小时兜底），否则用默认的自动关闭时长
+    int64_t GetUsagePanelHideTimeoutUs(int64_t default_us) {
+        return GetUsageRefreshMinutes() > 0 ? int64_t(12) * 3600 * 1000000LL : default_us;
+    }
+
+    // 面板显示期间按配置间隔（分钟）自动重新查询
+    void StartUsageAutoRefresh() {
+        int minutes = GetUsageRefreshMinutes();
+        if (minutes <= 0 || usage_refresh_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(usage_refresh_timer_);
+        esp_timer_start_once(usage_refresh_timer_, (int64_t)minutes * 60000000LL);
     }
 
     void RestartUsagePanelTimer(int64_t timeout_us) {
@@ -732,6 +1233,20 @@ private:
                 .skip_unhandled_events = true,
             };
             ESP_ERROR_CHECK(esp_timer_create(&timer_args, &usage_panel_timer_));
+        }
+        if (usage_refresh_timer_ == nullptr) {
+            esp_timer_create_args_t refresh_args = {
+                .callback = [](void* arg) {
+                    if (instance_->usage_panel_ != nullptr) {
+                        instance_->StartChatGptUsageQuery();
+                    }
+                },
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "usage_auto_refresh",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&refresh_args, &usage_refresh_timer_));
         }
         esp_timer_stop(usage_panel_timer_);
         esp_timer_start_once(usage_panel_timer_, timeout_us);
@@ -1088,12 +1603,16 @@ private:
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
         }
 
-        // 近 200 分钟请求分布 + 累计
-        AddDetailInfoLine(content, "近200分钟请求(绿成功/红失败)", 0x9AA0A6);
-        AddUsageBucketsChart(content, acc.buckets);
-        AddDetailInfoLine(content,
-                          "累计 成功" + std::to_string(acc.success_total) + " 失败" + std::to_string(acc.failed_total),
-                          0x9AA0A6);
+        // 近 200 分钟请求分布 + 累计（CPA 模式数据；直连模式无此数据）
+        if (!acc.buckets.empty()) {
+            AddDetailInfoLine(content, "近200分钟请求(绿成功/红失败)", 0x9AA0A6);
+            AddUsageBucketsChart(content, acc.buckets);
+        }
+        if (acc.success_total >= 0) {
+            AddDetailInfoLine(content,
+                              "累计 成功" + std::to_string(acc.success_total) + " 失败" + std::to_string(acc.failed_total),
+                              0x9AA0A6);
+        }
 
         if (!acc.last_refresh.empty()) {
             AddDetailInfoLine(content, "Token刷新 " + acc.last_refresh, 0x9AA0A6);
@@ -1101,10 +1620,11 @@ private:
         if (acc.disabled) {
             AddDetailInfoLine(content, "状态: 已禁用", 0xEA4335);
         } else if (acc.unavailable) {
-            AddDetailInfoLine(content, "状态: 限额冷却中", 0xFBBC04);
+            AddDetailInfoLine(content, "状态: 限额冷却/令牌异常", 0xFBBC04);
         }
 
-        RestartUsagePanelTimer(30000000LL);
+        RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(30000000LL));
+        StartUsageAutoRefresh();
     }
 
     // M 键在详情页再按时回到列表
@@ -1138,24 +1658,19 @@ private:
         if (usage_cooling_ > 0) {
             AddDetailInfoLine(content, "限额冷却:" + std::to_string(usage_cooling_) + "个账号", 0xFBBC04);
         }
-        RestartUsagePanelTimer(15000000LL);
+        RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
+        StartUsageAutoRefresh();
     }
 
     void ShowCodexRemaining(const std::string& base_url, const std::string& management_key,
                             std::vector<AccountDetail>& details, std::vector<std::string>& plans, int cooling) {
         // 逐账号出站查询较慢，最多查 4 个账号
         const size_t kMaxQueried = 4;
-        int min_remaining = 101;  // 最紧张账号的剩余与重置时间
-        int min_reset = -1;
         int failed = 0;
 
         for (size_t i = 0; i < details.size() && i < kMaxQueried; i++) {
             if (!FetchCodexRemaining(base_url, management_key, details[i])) {
                 failed++;
-            }
-            if (details[i].remaining_5h >= 0 && details[i].remaining_5h < min_remaining) {
-                min_remaining = details[i].remaining_5h;
-                min_reset = details[i].reset_5h;
             }
         }
 
@@ -1165,7 +1680,34 @@ private:
             return;
         }
 
-        // 副标题：账号数 + 套餐 + 最紧张账号的重置倒计时
+        ShowUsageListPanel(std::move(details), cooling);
+    }
+
+    // CPA 与直连两种模式的共用列表页；自动刷新后恢复原详情页
+    void ShowUsageListPanel(std::vector<AccountDetail> details, int cooling) {
+        std::vector<std::string> plans;
+        int min_remaining = 101;
+        int min_reset = -1;
+        for (auto& acc : details) {
+            if (acc.plan.empty()) {
+                continue;
+            }
+            bool exists = false;
+            for (auto& item : plans) {
+                if (strcasecmp(item.c_str(), acc.plan.c_str()) == 0) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                plans.push_back(acc.plan);
+            }
+            if (acc.remaining_5h >= 0 && acc.remaining_5h < min_remaining) {
+                min_remaining = acc.remaining_5h;
+                min_reset = acc.reset_5h;
+            }
+        }
+
         std::string subtitle = std::to_string(details.size()) + "账号";
         if (!plans.empty()) {
             subtitle += " · ";
@@ -1182,6 +1724,13 @@ private:
         usage_cooling_ = cooling;
         usage_detail_index_ = -1;
 
+        int restore = pending_detail_restore_;
+        pending_detail_restore_ = -1;
+        if (restore >= 0 && restore < (int)usage_details_.size()) {
+            ShowUsageDetailPanel(restore);
+            return;
+        }
+
         lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
         if (content == nullptr) {
             GetDisplay()->ShowNotification("用量面板创建失败", 3000);
@@ -1195,7 +1744,8 @@ private:
         if (cooling > 0) {
             AddDetailInfoLine(content, "限额冷却:" + std::to_string(cooling) + "个账号", 0xFBBC04);
         }
-        RestartUsagePanelTimer(15000000LL);
+        RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
+        StartUsageAutoRefresh();
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
