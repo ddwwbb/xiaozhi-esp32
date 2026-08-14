@@ -12,8 +12,11 @@
 
 #include "i2c_device.h"
 #include "sdkconfig.h"
+#include "settings.h"
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
+#include <esp_http_server.h>
+#include <esp_netif.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -27,6 +30,7 @@
 #include <string>
 #include <strings.h>
 #include <vector>
+#include <cctype>
 #include <ctime>
 
 #define TAG "atk_dnesp32s3_box2_wifi"
@@ -50,11 +54,31 @@ private:
     std::atomic<bool> usage_fetching_{false};
     // XIO_KEY_Q 有效电平无原理图依据（L 键低有效、M 键高有效），上电按空闲电平推断
     bool q_key_active_high_ = true;
+    // 长按 Q 进入的配置模式：临时 HTTP 页面把用量查询配置写入 NVS
+    bool usage_config_mode_ = false;
+    httpd_handle_t usage_config_server_ = nullptr;
+    esp_timer_handle_t usage_config_exit_timer_ = nullptr;
 
     struct CodexAccount {
         std::string auth_index;
         std::string account_id;
     };
+
+    // 用量查询配置：NVS（vendor 命名空间）优先，Kconfig 为出厂默认
+    struct CliproxyConfig {
+        std::string base_url;
+        std::string management_key;
+        std::string provider;
+    };
+
+    CliproxyConfig GetCliproxyConfig() {
+        CliproxyConfig cfg;
+        Settings settings("vendor");
+        cfg.base_url = settings.GetString("cliproxy_base_url", CONFIG_CLIPROXY_USAGE_BASE_URL);
+        cfg.management_key = settings.GetString("cliproxy_management_key", CONFIG_CLIPROXY_USAGE_MANAGEMENT_KEY);
+        cfg.provider = settings.GetString("cliproxy_provider", CONFIG_CLIPROXY_USAGE_PROVIDER);
+        return cfg;
+    }
 
     void InitializeBoardPowerManager() {
         instance_ = this;
@@ -165,9 +189,174 @@ private:
         GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
     }
 
+    static std::string UrlDecode(const std::string& in) {
+        std::string out;
+        out.reserve(in.size());
+        for (size_t i = 0; i < in.size(); i++) {
+            if (in[i] == '+') {
+                out += ' ';
+            } else if (in[i] == '%' && i + 2 < in.size() &&
+                       isxdigit((unsigned char)in[i + 1]) && isxdigit((unsigned char)in[i + 2])) {
+                out += (char)strtol(in.substr(i + 1, 2).c_str(), nullptr, 16);
+                i += 2;
+            } else {
+                out += in[i];
+            }
+        }
+        return out;
+    }
+
+    static std::string GetFormField(const std::string& body, const std::string& name) {
+        std::string key = name + "=";
+        size_t pos = body.find(key);
+        if (pos == std::string::npos) {
+            return "";
+        }
+        pos += key.size();
+        size_t end = body.find('&', pos);
+        return UrlDecode(body.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+    }
+
+    static esp_err_t UsageConfigGetHandler(httpd_req_t* req) {
+        auto cfg = instance_->GetCliproxyConfig();
+        char page[1024];
+        snprintf(page, sizeof(page),
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>用量查询配置</title></head>"
+            "<body style=\"font-family:sans-serif;max-width:480px;margin:40px auto\">"
+            "<h2>ChatGPT 用量查询配置</h2>"
+            "<form method=\"POST\" action=\"/save\">"
+            "<p>CLIProxyAPI 地址<br><input name=\"base_url\" value=\"%s\" style=\"width:100%%\" "
+            "placeholder=\"http://192.168.1.10:8317\"></p>"
+            "<p>Management Key<br><input name=\"management_key\" style=\"width:100%%\" "
+            "placeholder=\"留空表示不修改\"></p>"
+            "<p>Provider 过滤<br><input name=\"provider\" value=\"%s\" style=\"width:100%%\" "
+            "placeholder=\"codex\"></p>"
+            "<p><button type=\"submit\">保存</button></p>"
+            "<p><small>留空的字段保持不变；保存后设备自动退出配置模式。</small></p>"
+            "</form></body></html>",
+            cfg.base_url.c_str(), cfg.provider.c_str());
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    static esp_err_t UsageConfigSaveHandler(httpd_req_t* req) {
+        char body[768] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+
+        auto base_url = GetFormField(body, "base_url");
+        auto management_key = GetFormField(body, "management_key");
+        auto provider = GetFormField(body, "provider");
+
+        Settings settings("vendor", true);
+        if (!base_url.empty()) {
+            settings.SetString("cliproxy_base_url", base_url);
+        }
+        if (!management_key.empty()) {
+            settings.SetString("cliproxy_management_key", management_key);
+        }
+        if (!provider.empty()) {
+            settings.SetString("cliproxy_provider", provider);
+        }
+        settings.SetString("cliproxy_configured", "1");
+
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_send(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
+                             "<body><h3>已保存，设备正在退出配置模式</h3></body></html>",
+                        HTTPD_RESP_USE_STRLEN);
+
+        // httpd_stop 不能在处理器上下文里调用，延迟退出
+        esp_timer_stop(instance_->usage_config_exit_timer_);
+        esp_timer_start_once(instance_->usage_config_exit_timer_, 1500000);
+        return ESP_OK;
+    }
+
+    std::string GetLocalIpAddress() {
+        esp_netif_t* netif = nullptr;
+        while ((netif = esp_netif_next_unsafe(netif)) != nullptr) {
+            if (!esp_netif_is_netif_up(netif)) {
+                continue;
+            }
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+                char ip[16];
+                snprintf(ip, sizeof(ip), IPSTR, IP2STR(&ip_info.ip));
+                return ip;
+            }
+        }
+        return "";
+    }
+
+    void ExitUsageConfigMode() {
+        if (!usage_config_mode_) {
+            return;
+        }
+        usage_config_mode_ = false;
+        esp_timer_stop(usage_config_exit_timer_);
+        if (usage_config_server_ != nullptr) {
+            httpd_stop(usage_config_server_);
+            usage_config_server_ = nullptr;
+        }
+        GetDisplay()->ShowNotification("已退出配置模式", 2000);
+    }
+
+    void EnterUsageConfigMode() {
+        if (usage_config_mode_) {
+            return;
+        }
+        std::string ip = GetLocalIpAddress();
+        if (ip.empty()) {
+            GetDisplay()->ShowNotification("网络未连接,无法配置", 3000);
+            return;
+        }
+
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.stack_size = 8192;
+        if (httpd_start(&usage_config_server_, &config) != ESP_OK) {
+            usage_config_server_ = nullptr;
+            GetDisplay()->ShowNotification("配置模式启动失败", 3000);
+            return;
+        }
+
+        httpd_uri_t get_uri = {};
+        get_uri.uri = "/";
+        get_uri.method = HTTP_GET;
+        get_uri.handler = UsageConfigGetHandler;
+        httpd_register_uri_handler(usage_config_server_, &get_uri);
+
+        httpd_uri_t save_uri = {};
+        save_uri.uri = "/save";
+        save_uri.method = HTTP_POST;
+        save_uri.handler = UsageConfigSaveHandler;
+        httpd_register_uri_handler(usage_config_server_, &save_uri);
+
+        if (usage_config_exit_timer_ == nullptr) {
+            esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) { instance_->ExitUsageConfigMode(); },
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "usage_cfg_exit",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &usage_config_exit_timer_));
+        }
+
+        usage_config_mode_ = true;
+        // 5 分钟未操作自动退出，避免配置页面长期暴露在局域网
+        esp_timer_start_once(usage_config_exit_timer_, 300000000ULL);
+        GetDisplay()->ShowNotification("配置模式\nhttp://" + ip + "/", 300000);
+        ESP_LOGI(TAG, "Usage config mode: http://%s/", ip.c_str());
+    }
+
     // 查询 CLIProxyAPI (GET /v0/management/auth-files) 的账号套餐用量并在屏幕显示
-    void StartChatGptUsageQuery() {
-        if (usage_fetching_.exchange(true)) {
+    void StartChatGptUsageQuery() {        if (usage_fetching_.exchange(true)) {
             return;
         }
         if (xTaskCreate([](void* arg) {
@@ -192,19 +381,20 @@ private:
 
     void QueryChatGptUsage() {
         auto display = GetDisplay();
-        const char* base_url = CONFIG_CLIPROXY_USAGE_BASE_URL;
-        const char* management_key = CONFIG_CLIPROXY_USAGE_MANAGEMENT_KEY;
-        if (base_url[0] == '\0' || management_key[0] == '\0') {
-            display->ShowNotification("未配置CLIProxyAPI用量查询", 3000);
+        CliproxyConfig cfg = GetCliproxyConfig();
+        const std::string& base_url = cfg.base_url;
+        const std::string& management_key = cfg.management_key;
+        if (base_url.empty() || management_key.empty()) {
+            display->ShowNotification("未配置,长按Q键进入配置", 3000);
             return;
         }
 
         display->ShowNotification("查询套餐用量...", 30000);
 
-        std::string url = std::string(base_url) + "/v0/management/auth-files";
+        std::string url = base_url + "/v0/management/auth-files";
         auto http = GetNetwork()->CreateHttp(0);
         http->SetTimeout(10000);
-        http->SetHeader("Authorization", std::string("Bearer ") + management_key);
+        http->SetHeader("Authorization", "Bearer " + management_key);
         http->SetHeader("Accept", "application/json");
         if (!http->Open("GET", url)) {
             ESP_LOGE(TAG, "Usage query: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
@@ -233,7 +423,7 @@ private:
             return;
         }
 
-        const char* provider_filter = CONFIG_CLIPROXY_USAGE_PROVIDER;
+        const char* provider_filter = cfg.provider.c_str();
         int accounts = 0;
         int window_success = 0;
         int window_failed = 0;
@@ -437,7 +627,7 @@ private:
         return remaining_5h >= 0 || remaining_weekly >= 0;
     }
 
-    void ShowCodexRemaining(const char* base_url, const std::string& management_key,
+    void ShowCodexRemaining(const std::string& base_url, const std::string& management_key,
                             const std::vector<CodexAccount>& accounts, std::vector<std::string>& plans,
                             int cooling) {
         // 逐账号出站查询较慢，最多查 4 个账号
@@ -585,7 +775,7 @@ private:
         };
         ESP_ERROR_CHECK(iot_button_create(&m_btn_cfg, xio_m_btn_driver_, &m_btn_handle));
 
-        // 返回键（XIO_KEY_Q）：短按打断对话/查询用量，长按强制查询用量
+        // 返回键（XIO_KEY_Q）：短按打断对话/查询用量，长按进入用量查询配置模式
         q_key_active_high_ = IoExpanderGetLevel(XIO_KEY_Q) == 0;
         button_driver_t* xio_q_btn_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
         xio_q_btn_driver_->enable_power_save = false;
@@ -649,6 +839,9 @@ private:
         iot_button_register_cb(q_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
+            if (self->usage_config_mode_) {
+                return;
+            }
             auto& app = Application::GetInstance();
             auto state = app.GetDeviceState();
             if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
@@ -661,7 +854,11 @@ private:
         iot_button_register_cb(q_btn_handle, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
-            self->StartChatGptUsageQuery();
+            if (self->usage_config_mode_) {
+                self->ExitUsageConfigMode();
+            } else {
+                self->EnterUsageConfigMode();
+            }
         }, this);
 
         iot_button_register_cb(r_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
