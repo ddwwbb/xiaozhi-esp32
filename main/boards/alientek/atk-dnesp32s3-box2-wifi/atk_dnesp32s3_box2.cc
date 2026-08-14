@@ -28,8 +28,19 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <esp_crt_bundle.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/error.h>
+#include <mbedtls/net_sockets.h>
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+#include <fcntl.h>
+#include <errno.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <utility>
 #include <string>
 #include <strings.h>
 #include <vector>
@@ -145,6 +156,27 @@ private:
     int GetUsageRefreshMinutes() {
         Settings settings("vendor");
         return settings.GetInt("usage_refresh_minutes", 0);
+    }
+
+    // 直连模式可选代理（socks5 或 http CONNECT，均支持账号密码认证）
+    struct Socks5Config {
+        std::string type;  // "socks5" | "http"
+        std::string host;
+        int port = 0;
+        std::string user;
+        std::string pass;
+        bool enabled() const { return !host.empty() && port > 0; }
+    };
+
+    Socks5Config GetSocks5Config() {
+        Socks5Config proxy;
+        Settings settings("vendor");
+        proxy.type = settings.GetString("usage_proxy_type", "socks5");
+        proxy.host = settings.GetString("usage_proxy_host", "");
+        proxy.port = settings.GetInt("usage_proxy_port", 0);
+        proxy.user = settings.GetString("usage_proxy_user", "");
+        proxy.pass = settings.GetString("usage_proxy_pass", "");
+        return proxy;
     }
 
     void InitializeBoardPowerManager() {
@@ -286,6 +318,7 @@ private:
 
     static std::string GetConfigPage() {
         auto cfg = instance_->GetCliproxyConfig();
+        auto cfg_proxy = instance_->GetSocks5Config();
         int refresh_minutes = instance_->GetUsageRefreshMinutes();
 
         std::string page =
@@ -333,11 +366,28 @@ private:
                 "<p>Provider 过滤<br><input name=\"provider\" value=\"" + cfg.provider +
                 "\" style=\"width:100%\" placeholder=\"codex\"></p>"
 
+                "<h3>网络代理（直连模式可选）</h3>"
+                "<p>类型 "
+                "<select name=\"proxy_type\">"
+                "<option value=\"socks5\"" + std::string(cfg_proxy.type == "socks5" ? " selected" : "") + ">SOCKS5</option>"
+                "<option value=\"http\"" + std::string(cfg_proxy.type == "http" ? " selected" : "") + ">HTTP</option>"
+                "</select> "
+                "地址 <input name=\"proxy_host\" value=\"" + cfg_proxy.host +
+                "\" style=\"width:130px\" placeholder=\"192.168.1.2\"> "
+                "端口 <input name=\"proxy_port\" type=\"number\" value=\"" +
+                (cfg_proxy.port > 0 ? std::to_string(cfg_proxy.port) : "") +
+                "\" style=\"width:70px\" placeholder=\"7890\"></p>"
+                "<p>账号 <input name=\"proxy_user\" value=\"" + cfg_proxy.user +
+                "\" style=\"width:120px\"> "
+                "密码 <input name=\"proxy_pass\" type=\"password\" value=\"" + cfg_proxy.pass +
+                "\" style=\"width:120px\"> <small>无认证可留空；Clash/v2ray 混合端口两种类型都支持</small></p>"
+
                 "<h3>自动刷新</h3>"
                 "<p>间隔分钟（0=关闭，面板 15 秒自动关闭；大于 0 时面板常驻并按此间隔自动刷新）<br>"
                 "<input name=\"refresh_minutes\" type=\"number\" min=\"0\" max=\"1440\" value=\"" +
                 std::to_string(refresh_minutes) + "\" style=\"width:120px\"></p>"
-                "<p><button type=\"submit\">保存</button></p>"
+                "<p><button type=\"submit\">保存</button> "
+                "<button type=\"submit\" formaction=\"/clear_proxy\" formmethod=\"post\">清除代理</button></p>"
                 "<p><small>保存后设备自动退出配置模式；导入/删除账号不退出，可连续操作。</small></p>"
                 "</form></body></html>";
         return page;
@@ -454,6 +504,17 @@ private:
         return ESP_OK;
     }
 
+    static esp_err_t UsageConfigClearProxyHandler(httpd_req_t* req) {
+        Settings settings("vendor", true);
+        settings.SetString("usage_proxy_type", "socks5");
+        settings.EraseKey("usage_proxy_host");
+        settings.EraseKey("usage_proxy_port");
+        settings.EraseKey("usage_proxy_user");
+        settings.EraseKey("usage_proxy_pass");
+        SendSimplePage(req, "<h3>已清除代理设置</h3>", "返回");
+        return ESP_OK;
+    }
+
     static esp_err_t UsageConfigDeleteHandler(httpd_req_t* req) {
         char body[128] = {0};
         size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
@@ -487,6 +548,11 @@ private:
         auto management_key = GetFormField(body, "management_key");
         auto provider = GetFormField(body, "provider");
         auto refresh_minutes = GetFormField(body, "refresh_minutes");
+        auto proxy_type = GetFormField(body, "proxy_type");
+        auto proxy_host = GetFormField(body, "proxy_host");
+        auto proxy_port = GetFormField(body, "proxy_port");
+        auto proxy_user = GetFormField(body, "proxy_user");
+        auto proxy_pass = GetFormField(body, "proxy_pass");
 
         Settings settings("vendor", true);
         if (!base_url.empty()) {
@@ -497,6 +563,24 @@ private:
         }
         if (!provider.empty()) {
             settings.SetString("cliproxy_provider", provider);
+        }
+        if (!proxy_type.empty()) {
+            settings.SetString("usage_proxy_type", proxy_type == "http" ? "http" : "socks5");
+        }
+        if (!proxy_host.empty()) {
+            settings.SetString("usage_proxy_host", proxy_host);
+        }
+        if (!proxy_port.empty()) {
+            int port = atoi(proxy_port.c_str());
+            if (port > 0 && port < 65536) {
+                settings.SetInt("usage_proxy_port", port);
+            }
+        }
+        if (!proxy_user.empty()) {
+            settings.SetString("usage_proxy_user", proxy_user);
+        }
+        if (!proxy_pass.empty()) {
+            settings.SetString("usage_proxy_pass", proxy_pass);
         }
         if (!refresh_minutes.empty()) {
             int minutes = atoi(refresh_minutes.c_str());
@@ -589,6 +673,12 @@ private:
         delete_uri.handler = UsageConfigDeleteHandler;
         httpd_register_uri_handler(usage_config_server_, &delete_uri);
 
+        httpd_uri_t clear_proxy_uri = {};
+        clear_proxy_uri.uri = "/clear_proxy";
+        clear_proxy_uri.method = HTTP_POST;
+        clear_proxy_uri.handler = UsageConfigClearProxyHandler;
+        httpd_register_uri_handler(usage_config_server_, &clear_proxy_uri);
+
         if (usage_config_exit_timer_ == nullptr) {
             esp_timer_create_args_t timer_args = {
                 .callback = [](void* arg) { instance_->ExitUsageConfigMode(); },
@@ -616,7 +706,7 @@ private:
                 self->QueryChatGptUsage();
                 self->usage_fetching_ = false;
                 vTaskDelete(nullptr);
-            }, "usage_query", 6144, this, 4, nullptr) != pdPASS) {
+            }, "usage_query", 10240, this, 4, nullptr) != pdPASS) {
             usage_fetching_ = false;
         }
     }
@@ -989,6 +1079,415 @@ private:
         return acc.remaining_5h >= 0 || acc.remaining_weekly >= 0;
     }
 
+    // ---------------- 直连 HTTPS 客户端：可选 SOCKS5 代理（RFC1928/1929）+ mbedtls TLS ----------------
+
+    // 带超时的 TCP 连接（非阻塞 connect + select）
+    static int TcpConnect(const std::string& host, int port, int timeout_ms) {
+        struct addrinfo hints = {};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        struct addrinfo* result = nullptr;
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &result) != 0 || result == nullptr) {
+            ESP_LOGE(TAG, "TCP: resolve %s failed", host.c_str());
+            return -1;
+        }
+        int fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+        if (fd < 0) {
+            freeaddrinfo(result);
+            return -1;
+        }
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        int ret = connect(fd, result->ai_addr, result->ai_addrlen);
+        (void)ret;
+        freeaddrinfo(result);
+
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(fd, &write_set);
+        struct timeval tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
+        if (select(fd + 1, nullptr, &write_set, nullptr, &tv) <= 0) {
+            close(fd);
+            ESP_LOGE(TAG, "TCP: connect %s:%d timeout", host.c_str(), port);
+            return -1;
+        }
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+            close(fd);
+            ESP_LOGE(TAG, "TCP: connect %s:%d failed, errno=%d", host.c_str(), port, err);
+            return -1;
+        }
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
+        struct timeval io_tv = { .tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &io_tv, sizeof(io_tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &io_tv, sizeof(io_tv));
+        return fd;
+    }
+
+    static bool Socks5Handshake(int fd, const Socks5Config& proxy, const std::string& host, int port) {
+        auto socks_recv = [fd](uint8_t* buf, size_t len) -> bool {
+            size_t got = 0;
+            while (got < len) {
+                int n = recv(fd, buf + got, len - got, 0);
+                if (n <= 0) {
+                    return false;
+                }
+                got += n;
+            }
+            return true;
+        };
+
+        // 方法协商：无认证 + 账号密码
+        bool has_auth = !proxy.user.empty();
+        uint8_t greeting[4] = {0x05, (uint8_t)(has_auth ? 2 : 1), 0x00, 0x02};
+        if (send(fd, greeting, has_auth ? 4 : 3, 0) < 0) {
+            return false;
+        }
+        uint8_t reply[2] = {0};
+        if (!socks_recv(reply, 2) || reply[0] != 0x05 || reply[1] == 0xFF) {
+            ESP_LOGE(TAG, "SOCKS5: greeting rejected");
+            return false;
+        }
+        if (reply[1] == 0x02) {
+            // RFC1929 账号密码认证
+            if (proxy.user.size() > 255 || proxy.pass.size() > 255) {
+                return false;
+            }
+            std::vector<uint8_t> auth(3 + proxy.user.size() + proxy.pass.size());
+            size_t pos = 0;
+            auth[pos++] = 0x01;
+            auth[pos++] = (uint8_t)proxy.user.size();
+            memcpy(auth.data() + pos, proxy.user.data(), proxy.user.size());
+            pos += proxy.user.size();
+            auth[pos++] = (uint8_t)proxy.pass.size();
+            memcpy(auth.data() + pos, proxy.pass.data(), proxy.pass.size());
+            if (send(fd, auth.data(), auth.size(), 0) < 0) {
+                return false;
+            }
+            uint8_t auth_reply[2] = {0};
+            if (!socks_recv(auth_reply, 2) || auth_reply[1] != 0x00) {
+                ESP_LOGE(TAG, "SOCKS5: auth failed");
+                return false;
+            }
+        } else if (reply[1] != 0x00) {
+            return false;
+        }
+
+        // CONNECT（域名由代理解析）
+        if (host.size() > 255) {
+            return false;
+        }
+        std::vector<uint8_t> request(7 + host.size());
+        size_t pos = 0;
+        request[pos++] = 0x05;
+        request[pos++] = 0x01;
+        request[pos++] = 0x00;
+        request[pos++] = 0x03;  // 域名
+        request[pos++] = (uint8_t)host.size();
+        memcpy(request.data() + pos, host.data(), host.size());
+        pos += host.size();
+        request[pos++] = (uint8_t)(port >> 8);
+        request[pos++] = (uint8_t)(port & 0xFF);
+        if (send(fd, request.data(), request.size(), 0) < 0) {
+            return false;
+        }
+        uint8_t head[4] = {0};
+        if (!socks_recv(head, 4) || head[0] != 0x05 || head[1] != 0x00) {
+            ESP_LOGE(TAG, "SOCKS5: connect %s:%d rejected, rep=0x%02x", host.c_str(), port, head[1]);
+            return false;
+        }
+        // 跳过绑定地址
+        size_t addr_len = head[3] == 0x01 ? 4 : (head[3] == 0x04 ? 16 : 0);
+        if (addr_len == 0) {
+            uint8_t len8 = 0;
+            if (!socks_recv(&len8, 1)) {
+                return false;
+            }
+            addr_len = len8;
+        }
+        std::vector<uint8_t> skip(addr_len + 2);
+        return socks_recv(skip.data(), skip.size());
+    }
+
+    static std::string Base64Encode(const std::string& in) {
+        static const char* kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve((in.size() + 2) / 3 * 4);
+        int val = 0, valb = -6;
+        for (uint8_t c : in) {
+            val = (val << 8) + c;
+            valb += 8;
+            while (valb >= 0) {
+                out.push_back(kAlphabet[(val >> valb) & 0x3F]);
+                valb -= 6;
+            }
+        }
+        if (valb > -6) {
+            out.push_back(kAlphabet[((val << 8) >> (valb + 8)) & 0x3F]);
+        }
+        while (out.size() % 4 != 0) {
+            out.push_back('=');
+        }
+        return out;
+    }
+
+    // HTTP CONNECT 隧道（支持 Basic 账号密码认证），成功后该 TCP 直接承载 TLS
+    static bool HttpProxyHandshake(int fd, const Socks5Config& proxy, const std::string& host, int port) {
+        std::string req = "CONNECT " + host + ":" + std::to_string(port) + " HTTP/1.1\r\n";
+        req += "Host: " + host + ":" + std::to_string(port) + "\r\n";
+        if (!proxy.user.empty()) {
+            req += "Proxy-Authorization: Basic " + Base64Encode(proxy.user + ":" + proxy.pass) + "\r\n";
+        }
+        req += "\r\n";
+        if (send(fd, req.c_str(), req.size(), 0) < 0) {
+            return false;
+        }
+
+        // 读到响应头结束，判断状态码
+        std::string raw;
+        raw.reserve(512);
+        char buf[256];
+        while (raw.find("\r\n\r\n") == std::string::npos && raw.size() < 1024) {
+            int n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                ESP_LOGE(TAG, "HTTP proxy: no response");
+                return false;
+            }
+            raw.append(buf, n);
+        }
+        if (raw.compare(0, 5, "HTTP/") != 0) {
+            ESP_LOGE(TAG, "HTTP proxy: bad response");
+            return false;
+        }
+        size_t sp = raw.find(' ');
+        int status = sp == std::string::npos ? 0 : atoi(raw.c_str() + sp + 1);
+        if (status != 200) {
+            ESP_LOGE(TAG, "HTTP proxy: CONNECT rejected, status=%d", status);
+            return false;
+        }
+        return true;
+    }
+
+    struct TlsClient {
+        mbedtls_ssl_context ssl{};
+        mbedtls_ssl_config conf{};
+        bool valid = false;
+
+        ~TlsClient() {
+            if (valid) {
+                mbedtls_ssl_close_notify(&ssl);
+            }
+            mbedtls_ssl_free(&ssl);
+            mbedtls_ssl_config_free(&conf);
+        }
+
+
+        static int SendCb(void* ctx, const unsigned char* buf, size_t len) {
+            int fd = (int)(intptr_t)ctx;
+            int n = send(fd, buf, len, 0);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                return MBEDTLS_ERR_SSL_WANT_WRITE;
+            }
+            if (n < 0) {
+                return MBEDTLS_ERR_NET_SEND_FAILED;
+            }
+            return n;
+        }
+
+        static int RecvCb(void* ctx, unsigned char* buf, size_t len) {
+            int fd = (int)(intptr_t)ctx;
+            int n = recv(fd, buf, len, 0);
+            if (n == 0) {
+                return MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY;
+            }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                return MBEDTLS_ERR_SSL_WANT_READ;
+            }
+            if (n < 0) {
+                return MBEDTLS_ERR_NET_RECV_FAILED;
+            }
+            return n;
+        }
+
+        bool Connect(int fd, const std::string& host, int timeout_ms) {
+            mbedtls_ssl_init(&ssl);
+            mbedtls_ssl_config_init(&conf);
+            if (mbedtls_ssl_config_defaults(&conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
+                                            MBEDTLS_SSL_PRESET_DEFAULT) != 0) {
+                return false;
+            }
+            mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+            if (esp_crt_bundle_attach(&conf) != ESP_OK) {
+                ESP_LOGE(TAG, "TLS: crt bundle attach failed");
+                return false;
+            }
+            if (mbedtls_ssl_setup(&ssl, &conf) != 0) {
+                return false;
+            }
+            if (mbedtls_ssl_set_hostname(&ssl, host.c_str()) != 0) {
+                return false;
+            }
+            mbedtls_ssl_set_bio(&ssl, (void*)(intptr_t)fd, SendCb, RecvCb, nullptr);
+
+            int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+            int ret = 0;
+            while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+                if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    char err[64];
+                    mbedtls_strerror(ret, err, sizeof(err));
+                    ESP_LOGE(TAG, "TLS: handshake with %s failed: %s", host.c_str(), err);
+                    return false;
+                }
+                if (esp_timer_get_time() > deadline) {
+                    ESP_LOGE(TAG, "TLS: handshake timeout");
+                    return false;
+                }
+            }
+            valid = true;
+            return true;
+        }
+
+        bool WriteAll(const std::string& data, int timeout_ms) {
+            size_t sent = 0;
+            int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+            while (sent < data.size()) {
+                int n = mbedtls_ssl_write(&ssl, (const unsigned char*)data.data() + sent, data.size() - sent);
+                if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    if (esp_timer_get_time() > deadline) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (n <= 0) {
+                    return false;
+                }
+                sent += n;
+            }
+            return true;
+        }
+
+        // 读到对端关闭或超时；max_bytes 上限保护
+        bool ReadAll(std::string& out, size_t max_bytes, int timeout_ms) {
+            char buf[1024];
+            int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+            while (out.size() < max_bytes) {
+                int n = mbedtls_ssl_read(&ssl, (unsigned char*)buf, sizeof(buf));
+                if (n == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || n == 0) {
+                    break;
+                }
+                if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    if (esp_timer_get_time() > deadline) {
+                        break;
+                    }
+                    continue;
+                }
+                if (n < 0) {
+                    ESP_LOGE(TAG, "TLS: read error -0x%x", -n);
+                    return false;
+                }
+                out.append(buf, n);
+            }
+            return true;
+        }
+    };
+
+    static bool HttpsDechunk(std::string& body) {
+        std::string out;
+        out.reserve(body.size());
+        size_t pos = 0;
+        while (pos + 2 <= body.size()) {
+            size_t eol = body.find("\r\n", pos);
+            if (eol == std::string::npos) {
+                break;
+            }
+            unsigned long size = strtoul(body.substr(pos, eol - pos).c_str(), nullptr, 16);
+            pos = eol + 2;
+            if (size == 0) {
+                break;
+            }
+            size_t take = std::min<size_t>(size, body.size() - pos);
+            out.append(body, pos, take);
+            pos += take + 2;
+        }
+        body = std::move(out);
+        return true;
+    }
+
+    // HTTPS 请求（走/不走 SOCKS5 均可）：Connection: close，一次一连接
+    static bool HttpsRequest(const std::string& host, const std::string& path, const char* method,
+                             const std::vector<std::pair<std::string, std::string>>& headers,
+                             const std::string& body, int& status_code, std::string& resp_body) {
+        auto proxy = instance_->GetSocks5Config();
+        std::string connect_host = proxy.enabled() ? proxy.host : host;
+        int connect_port = proxy.enabled() ? proxy.port : 443;
+
+        int fd = TcpConnect(connect_host, connect_port, 10000);
+        if (fd < 0) {
+            return false;
+        }
+        bool ok = true;
+        if (proxy.enabled()) {
+            if (proxy.type == "http") {
+                ok = HttpProxyHandshake(fd, proxy, host, 443);
+            } else {
+                ok = Socks5Handshake(fd, proxy, host, 443);
+            }
+        }
+
+        TlsClient tls;
+        if (ok) {
+            ok = tls.Connect(fd, host, 10000);
+        }
+        if (ok) {
+            std::string req = std::string(method) + " " + path + " HTTP/1.1\r\n";
+            req += "Host: " + host + "\r\nConnection: close\r\nAccept: application/json\r\n";
+            for (auto& header : headers) {
+                req += header.first + ": " + header.second + "\r\n";
+            }
+            if (!body.empty()) {
+                req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+            }
+            req += "\r\n" + body;
+            ok = tls.WriteAll(req, 10000);
+        }
+        std::string raw;
+        if (ok) {
+            ok = tls.ReadAll(raw, 20 * 1024, 10000);
+        }
+        close(fd);
+        if (!ok || raw.empty()) {
+            return false;
+        }
+
+        // 解析状态行
+        if (raw.compare(0, 5, "HTTP/") != 0) {
+            return false;
+        }
+        size_t sp = raw.find(' ');
+        if (sp == std::string::npos) {
+            return false;
+        }
+        status_code = atoi(raw.c_str() + sp + 1);
+
+        size_t header_end = raw.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            resp_body.clear();
+            return true;
+        }
+        std::string header_block = raw.substr(0, header_end);
+        resp_body = raw.substr(header_end + 4);
+        std::string lower;
+        lower.reserve(header_block.size());
+        for (char c : header_block) {
+            lower.push_back((char)tolower((unsigned char)c));
+        }
+        if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+            HttpsDechunk(resp_body);
+        }
+        return true;
+    }
+
     static bool Base64UrlDecode(const std::string& in, std::string& out) {
         auto value_of = [](char c) -> int {
             if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -1065,19 +1564,18 @@ private:
     // 直连官方接口 GET chatgpt.com/backend-api/wham/usage；返回 HTTP 状态码，200 时填充 acc
     static int DirectFetchUsage(const std::string& access_token, const std::string& account_id,
                                 AccountDetail& acc) {
-        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-        http->SetTimeout(10000);
-        http->SetHeader("Authorization", "Bearer " + access_token);
-        http->SetHeader("Content-Type", "application/json");
-        http->SetHeader("User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal");
-        http->SetHeader("Chatgpt-Account-Id", account_id);
-        if (!http->Open("GET", "https://chatgpt.com/backend-api/wham/usage")) {
-            ESP_LOGE(TAG, "Direct usage: open failed, err=0x%x", http->GetLastError());
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Authorization", "Bearer " + access_token},
+            {"Content-Type", "application/json"},
+            {"User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"},
+            {"Chatgpt-Account-Id", account_id},
+        };
+        int status = 0;
+        std::string body;
+        if (!HttpsRequest("chatgpt.com", "/backend-api/wham/usage", "GET", headers, "", status, body)) {
+            ESP_LOGE(TAG, "Direct usage: request failed (%s)", acc.name.c_str());
             return -1;
         }
-        int status = http->GetStatusCode();
-        std::string body = status == 200 ? http->ReadAll() : "";
-        http->Close();
         if (status != 200) {
             ESP_LOGE(TAG, "Direct usage: HTTP %d (%s)", status, acc.name.c_str());
             return status;
@@ -1119,18 +1617,15 @@ private:
                            "&refresh_token=" + std::string(refresh_item->valuestring) +
                            "&scope=openid%20profile%20email";
 
-        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-        http->SetTimeout(10000);
-        http->SetHeader("Content-Type", "application/x-www-form-urlencoded");
-        http->SetHeader("Accept", "application/json");
-        http->SetContent(std::move(body));
-        if (!http->Open("POST", "https://auth.openai.com/oauth/token")) {
-            ESP_LOGE(TAG, "Token refresh: open failed, err=0x%x", http->GetLastError());
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Content-Type", "application/x-www-form-urlencoded"},
+        };
+        int status = 0;
+        std::string resp;
+        if (!HttpsRequest("auth.openai.com", "/oauth/token", "POST", headers, body, status, resp)) {
+            ESP_LOGE(TAG, "Token refresh: request failed");
             return "";
         }
-        int status = http->GetStatusCode();
-        std::string resp = status == 200 ? http->ReadAll() : "";
-        http->Close();
         if (status != 200) {
             ESP_LOGE(TAG, "Token refresh: HTTP %d", status);
             return "";
