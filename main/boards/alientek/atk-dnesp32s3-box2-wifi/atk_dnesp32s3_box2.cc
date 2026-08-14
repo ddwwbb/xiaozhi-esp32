@@ -27,6 +27,7 @@
 #include <string>
 #include <strings.h>
 #include <vector>
+#include <ctime>
 
 #define TAG "atk_dnesp32s3_box2_wifi"
 
@@ -49,6 +50,11 @@ private:
     std::atomic<bool> usage_fetching_{false};
     // XIO_KEY_Q 有效电平无原理图依据（L 键低有效、M 键高有效），上电按空闲电平推断
     bool q_key_active_high_ = true;
+
+    struct CodexAccount {
+        std::string auth_index;
+        std::string account_id;
+    };
 
     void InitializeBoardPowerManager() {
         instance_ = this;
@@ -193,7 +199,7 @@ private:
             return;
         }
 
-        display->ShowNotification("查询套餐用量...", 8000);
+        display->ShowNotification("查询套餐用量...", 30000);
 
         std::string url = std::string(base_url) + "/v0/management/auth-files";
         auto http = GetNetwork()->CreateHttp(0);
@@ -233,6 +239,7 @@ private:
         int window_failed = 0;
         int cooling = 0;
         std::vector<std::string> plans;
+        std::vector<CodexAccount> codex_accounts;
 
         cJSON* files = cJSON_GetObjectItem(root, "files");
         cJSON* file = nullptr;
@@ -247,14 +254,15 @@ private:
             }
             accounts++;
 
-            // recent_requests: 20 个 10 分钟桶，约 200 分钟窗口
+            // recent_requests: 20 个 10 分钟桶，约 200 分钟窗口（provider 非 codex 时的回退显示）
             cJSON* bucket = nullptr;
             cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(file, "recent_requests")) {
                 window_success += GetJsonInt(bucket, "success");
                 window_failed += GetJsonInt(bucket, "failed");
             }
 
-            if (GetJsonBool(file, "unavailable") || GetJsonBool(file, "disabled")) {
+            bool unavailable = GetJsonBool(file, "unavailable") || GetJsonBool(file, "disabled");
+            if (unavailable) {
                 cooling++;
             }
 
@@ -279,7 +287,18 @@ private:
                      provider,
                      cJSON_IsString(email_item) ? email_item->valuestring : "-",
                      plan ? plan : "-",
-                     GetJsonBool(file, "unavailable") ? 1 : 0);
+                     unavailable ? 1 : 0);
+
+            if (strcasecmp(provider, "codex") == 0) {
+                CodexAccount acc;
+                cJSON* index_item = cJSON_GetObjectItem(file, "auth_index");
+                acc.auth_index = cJSON_IsString(index_item) ? index_item->valuestring : "";
+                cJSON* account_item = id_token ? cJSON_GetObjectItem(id_token, "chatgpt_account_id") : nullptr;
+                acc.account_id = cJSON_IsString(account_item) ? account_item->valuestring : "";
+                if (!acc.auth_index.empty() && !acc.account_id.empty()) {
+                    codex_accounts.push_back(acc);
+                }
+            }
         }
         cJSON_Delete(root);
 
@@ -289,6 +308,11 @@ private:
         }
         if (accounts == 0) {
             display->ShowNotification("无" + label + "账号凭证", 3000);
+            return;
+        }
+
+        if (strcasecmp(provider_filter, "codex") == 0 && !codex_accounts.empty()) {
+            ShowCodexRemaining(base_url, management_key, codex_accounts, plans, cooling);
             return;
         }
 
@@ -306,6 +330,175 @@ private:
             text += "\n限额冷却:" + std::to_string(cooling) + "个";
         }
         display->ShowNotification(text, 8000);
+    }
+
+    // 窗口剩余百分比：优先 used_percent，退回 remaining_count/total_count；未知返回 -1
+    static int WindowRemainingPct(cJSON* window) {
+        if (window == nullptr) {
+            return -1;
+        }
+        cJSON* used = cJSON_GetObjectItem(window, "used_percent");
+        if (cJSON_IsNumber(used)) {
+            int remaining = 100 - used->valueint;
+            return remaining < 0 ? 0 : (remaining > 100 ? 100 : remaining);
+        }
+        cJSON* remaining = cJSON_GetObjectItem(window, "remaining_count");
+        cJSON* total = cJSON_GetObjectItem(window, "total_count");
+        if (cJSON_IsNumber(remaining) && cJSON_IsNumber(total) && total->valueint > 0) {
+            return remaining->valueint * 100 / total->valueint;
+        }
+        return -1;
+    }
+
+    static int WindowResetSeconds(cJSON* window) {
+        if (window == nullptr) {
+            return -1;
+        }
+        cJSON* after = cJSON_GetObjectItem(window, "reset_after_seconds");
+        if (cJSON_IsNumber(after) && after->valueint > 0) {
+            return after->valueint;
+        }
+        cJSON* at = cJSON_GetObjectItem(window, "reset_at");
+        if (cJSON_IsNumber(at) && at->valueint > 0) {
+            return at->valueint - (int)time(nullptr);
+        }
+        return -1;
+    }
+
+    // 通过 POST /v0/management/api-call 用账号令牌代呼
+    // https://chatgpt.com/backend-api/wham/usage，返回 5h/每周剩余百分比
+    static bool FetchCodexRemaining(const std::string& base_url, const std::string& management_key,
+                                    const std::string& auth_index, const std::string& account_id,
+                                    int& remaining_5h, int& remaining_weekly, int& reset_5h_seconds) {
+        remaining_5h = -1;
+        remaining_weekly = -1;
+        reset_5h_seconds = -1;
+
+        cJSON* header = cJSON_CreateObject();
+        cJSON_AddStringToObject(header, "Authorization", "Bearer $TOKEN$");
+        cJSON_AddStringToObject(header, "Content-Type", "application/json");
+        cJSON_AddStringToObject(header, "User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal");
+        cJSON_AddStringToObject(header, "Chatgpt-Account-Id", account_id.c_str());
+        cJSON* request = cJSON_CreateObject();
+        cJSON_AddStringToObject(request, "auth_index", auth_index.c_str());
+        cJSON_AddStringToObject(request, "method", "GET");
+        cJSON_AddStringToObject(request, "url", "https://chatgpt.com/backend-api/wham/usage");
+        cJSON_AddItemToObject(request, "header", header);
+        char* printed = cJSON_PrintUnformatted(request);
+        std::string payload = printed != nullptr ? printed : "";
+        cJSON_free(printed);
+        cJSON_Delete(request);
+        if (payload.empty()) {
+            return false;
+        }
+
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
+        http->SetTimeout(8000);
+        http->SetHeader("Authorization", "Bearer " + management_key);
+        http->SetHeader("Content-Type", "application/json");
+        http->SetContent(std::move(payload));
+        std::string url = base_url + "/v0/management/api-call";
+        if (!http->Open("POST", url)) {
+            ESP_LOGE(TAG, "api-call: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
+            return false;
+        }
+        int status = http->GetStatusCode();
+        std::string body = status == 200 ? http->ReadAll() : "";
+        http->Close();
+        if (status != 200) {
+            ESP_LOGE(TAG, "api-call: HTTP %d (auth_index=%s)", status, auth_index.c_str());
+            return false;
+        }
+
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            return false;
+        }
+        cJSON* upstream_status = cJSON_GetObjectItem(root, "status_code");
+        cJSON* usage_body = cJSON_GetObjectItem(root, "body");
+        cJSON* usage = (cJSON_IsNumber(upstream_status) && upstream_status->valueint == 200 &&
+                        cJSON_IsString(usage_body))
+                           ? cJSON_Parse(usage_body->valuestring)
+                           : nullptr;
+        cJSON_Delete(root);
+        if (usage == nullptr) {
+            return false;
+        }
+
+        cJSON* rate_limit = cJSON_GetObjectItem(usage, "rate_limit");
+        cJSON* primary = rate_limit ? cJSON_GetObjectItem(rate_limit, "primary_window") : nullptr;
+        cJSON* secondary = rate_limit ? cJSON_GetObjectItem(rate_limit, "secondary_window") : nullptr;
+        remaining_5h = WindowRemainingPct(primary);
+        remaining_weekly = WindowRemainingPct(secondary);
+        reset_5h_seconds = WindowResetSeconds(primary);
+        ESP_LOGI(TAG, "Codex usage: auth_index=%s 5h=%d%% weekly=%d%% reset=%ds",
+                 auth_index.c_str(), remaining_5h, remaining_weekly, reset_5h_seconds);
+        cJSON_Delete(usage);
+        return remaining_5h >= 0 || remaining_weekly >= 0;
+    }
+
+    void ShowCodexRemaining(const char* base_url, const std::string& management_key,
+                            const std::vector<CodexAccount>& accounts, std::vector<std::string>& plans,
+                            int cooling) {
+        // 逐账号出站查询较慢，最多查 4 个账号
+        const size_t kMaxQueried = 4;
+        std::string line_5h = "5h余:";
+        std::string line_weekly = "周余:";
+        int min_remaining = 101;  // 最紧张账号的剩余与重置时间
+        int min_reset = -1;
+        int queried = 0;
+        int failed = 0;
+
+        for (size_t i = 0; i < accounts.size() && i < kMaxQueried; i++) {
+            int remaining_5h = -1;
+            int remaining_weekly = -1;
+            int reset_5h = -1;
+            if (!FetchCodexRemaining(base_url, management_key, accounts[i].auth_index,
+                                     accounts[i].account_id, remaining_5h, remaining_weekly, reset_5h)) {
+                failed++;
+            }
+            if (queried > 0) {
+                line_5h += "|";
+                line_weekly += "|";
+            }
+            line_5h += remaining_5h >= 0 ? std::to_string(remaining_5h) + "%" : "?";
+            line_weekly += remaining_weekly >= 0 ? std::to_string(remaining_weekly) + "%" : "?";
+            if (remaining_5h >= 0 && remaining_5h < min_remaining) {
+                min_remaining = remaining_5h;
+                min_reset = reset_5h;
+            }
+            queried++;
+        }
+
+        if (queried == 0 || (failed == queried)) {
+            GetDisplay()->ShowNotification("剩余用量查询失败:api-call不可用", 3000);
+            return;
+        }
+
+        std::string text = "ChatGPT:" + std::to_string(accounts.size()) + "个";
+        if (!plans.empty()) {
+            text += "(";
+            for (size_t i = 0; i < plans.size(); i++) {
+                if (i > 0) text += ",";
+                text += plans[i];
+            }
+            text += ")";
+        }
+        text += "\n" + line_5h;
+        if (min_reset > 0) {
+            char reset_label[24];
+            if (min_reset >= 3600) {
+                snprintf(reset_label, sizeof(reset_label), " %.1f时重置", min_reset / 3600.0);
+            } else {
+                snprintf(reset_label, sizeof(reset_label), " %d分重置", min_reset / 60);
+            }
+            text += reset_label;
+        }
+        text += "\n" + line_weekly;
+        if (cooling > 0) {
+            text += "\n限额冷却:" + std::to_string(cooling) + "个";
+        }
+        GetDisplay()->ShowNotification(text, 8000);
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
