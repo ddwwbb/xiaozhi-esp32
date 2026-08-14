@@ -1101,6 +1101,33 @@ menu "Camera Configuration"
     endif
 endmenu
 
+menu "ChatGPT Usage Display (CLIProxyAPI)"
+    config CLIPROXY_USAGE_BASE_URL
+        string "CLIProxyAPI management base URL"
+        default ""
+        help
+            Base URL of your CLIProxyAPI instance, including port.
+            Example: http://192.168.1.10:8317
+            The firmware queries GET <base>/v0/management/auth-files to show
+            ChatGPT/Codex plan usage on the device screen.
+            Leave empty to disable the feature (the key then only interrupts chat).
+
+    config CLIPROXY_USAGE_MANAGEMENT_KEY
+        string "CLIProxyAPI management key"
+        default ""
+        help
+            Value of remote-management.secret-key in the CLIProxyAPI config.
+            Requires remote-management to be enabled (allow-remote with a
+            secret key) on the CLIProxyAPI instance.
+
+    config CLIPROXY_USAGE_PROVIDER
+        string "Credential provider filter"
+        default "codex"
+        help
+            Only aggregate credentials of this provider (codex = ChatGPT
+            accounts). Leave empty to aggregate all providers.
+endmenu
+
 menu "TAIJIPAI_S3_CONFIG"
     depends on BOARD_TYPE_TAIJI_PI_S3
     choice I2S_TYPE_TAIJIPI_S3

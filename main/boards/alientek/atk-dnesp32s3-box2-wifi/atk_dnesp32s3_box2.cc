@@ -11,12 +11,22 @@
 #include "power_manager.h"
 
 #include "i2c_device.h"
+#include "sdkconfig.h"
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include "esp_io_expander_tca95xx_16bit.h"
+
+#include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <atomic>
+#include <string>
+#include <strings.h>
+#include <vector>
 
 #define TAG "atk_dnesp32s3_box2_wifi"
 
@@ -36,6 +46,9 @@ private:
     esp_lcd_panel_handle_t panel = nullptr;
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
+    std::atomic<bool> usage_fetching_{false};
+    // XIO_KEY_Q 有效电平无原理图依据（L 键低有效、M 键高有效），上电按空闲电平推断
+    bool q_key_active_high_ = true;
 
     void InitializeBoardPowerManager() {
         instance_ = this;
@@ -146,6 +159,155 @@ private:
         GetDisplay()->ShowNotification(Lang::Strings::MAX_VOLUME);
     }
 
+    // 查询 CLIProxyAPI (GET /v0/management/auth-files) 的账号套餐用量并在屏幕显示
+    void StartChatGptUsageQuery() {
+        if (usage_fetching_.exchange(true)) {
+            return;
+        }
+        if (xTaskCreate([](void* arg) {
+                auto self = static_cast<atk_dnesp32s3_box2_wifi*>(arg);
+                self->QueryChatGptUsage();
+                self->usage_fetching_ = false;
+                vTaskDelete(nullptr);
+            }, "usage_query", 6144, this, 4, nullptr) != pdPASS) {
+            usage_fetching_ = false;
+        }
+    }
+
+    static int GetJsonInt(cJSON* obj, const char* key) {
+        cJSON* item = cJSON_GetObjectItem(obj, key);
+        return cJSON_IsNumber(item) ? item->valueint : 0;
+    }
+
+    static bool GetJsonBool(cJSON* obj, const char* key) {
+        cJSON* item = cJSON_GetObjectItem(obj, key);
+        return cJSON_IsTrue(item);
+    }
+
+    void QueryChatGptUsage() {
+        auto display = GetDisplay();
+        const char* base_url = CONFIG_CLIPROXY_USAGE_BASE_URL;
+        const char* management_key = CONFIG_CLIPROXY_USAGE_MANAGEMENT_KEY;
+        if (base_url[0] == '\0' || management_key[0] == '\0') {
+            display->ShowNotification("未配置CLIProxyAPI用量查询", 3000);
+            return;
+        }
+
+        display->ShowNotification("查询套餐用量...", 8000);
+
+        std::string url = std::string(base_url) + "/v0/management/auth-files";
+        auto http = GetNetwork()->CreateHttp(0);
+        http->SetTimeout(10000);
+        http->SetHeader("Authorization", std::string("Bearer ") + management_key);
+        http->SetHeader("Accept", "application/json");
+        if (!http->Open("GET", url)) {
+            ESP_LOGE(TAG, "Usage query: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
+            display->ShowNotification("用量查询失败:无法连接", 3000);
+            return;
+        }
+        int status = http->GetStatusCode();
+        std::string body = status == 200 ? http->ReadAll() : "";
+        http->Close();
+
+        if (status != 200) {
+            ESP_LOGE(TAG, "Usage query: HTTP %d", status);
+            std::string reason = "查询失败:HTTP " + std::to_string(status);
+            if (status == 401) {
+                reason = "查询失败:密钥错误(401)";
+            } else if (status == 404) {
+                reason = "查询失败:管理接口未启用(404)";
+            }
+            display->ShowNotification(reason, 3000);
+            return;
+        }
+
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            display->ShowNotification("用量查询失败:响应解析错误", 3000);
+            return;
+        }
+
+        const char* provider_filter = CONFIG_CLIPROXY_USAGE_PROVIDER;
+        int accounts = 0;
+        int window_success = 0;
+        int window_failed = 0;
+        int cooling = 0;
+        std::vector<std::string> plans;
+
+        cJSON* files = cJSON_GetObjectItem(root, "files");
+        cJSON* file = nullptr;
+        cJSON_ArrayForEach(file, files) {
+            if (!cJSON_IsObject(file)) {
+                continue;
+            }
+            cJSON* provider_item = cJSON_GetObjectItem(file, "provider");
+            const char* provider = cJSON_IsString(provider_item) ? provider_item->valuestring : "";
+            if (provider_filter[0] != '\0' && strcasecmp(provider, provider_filter) != 0) {
+                continue;
+            }
+            accounts++;
+
+            // recent_requests: 20 个 10 分钟桶，约 200 分钟窗口
+            cJSON* bucket = nullptr;
+            cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(file, "recent_requests")) {
+                window_success += GetJsonInt(bucket, "success");
+                window_failed += GetJsonInt(bucket, "failed");
+            }
+
+            if (GetJsonBool(file, "unavailable") || GetJsonBool(file, "disabled")) {
+                cooling++;
+            }
+
+            cJSON* id_token = cJSON_GetObjectItem(file, "id_token");
+            cJSON* plan_item = id_token ? cJSON_GetObjectItem(id_token, "plan_type") : nullptr;
+            const char* plan = cJSON_IsString(plan_item) ? plan_item->valuestring : nullptr;
+            if (plan != nullptr && plan[0] != '\0') {
+                bool exists = false;
+                for (auto& p : plans) {
+                    if (strcasecmp(p.c_str(), plan) == 0) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    plans.push_back(plan);
+                }
+            }
+
+            cJSON* email_item = cJSON_GetObjectItem(file, "email");
+            ESP_LOGI(TAG, "Usage: provider=%s email=%s plan=%s unavailable=%d",
+                     provider,
+                     cJSON_IsString(email_item) ? email_item->valuestring : "-",
+                     plan ? plan : "-",
+                     GetJsonBool(file, "unavailable") ? 1 : 0);
+        }
+        cJSON_Delete(root);
+
+        std::string label = "账号";
+        if (provider_filter[0] != '\0') {
+            label = strcasecmp(provider_filter, "codex") == 0 ? "ChatGPT" : provider_filter;
+        }
+        if (accounts == 0) {
+            display->ShowNotification("无" + label + "账号凭证", 3000);
+            return;
+        }
+
+        std::string text = label + "账号:" + std::to_string(accounts) + "个";
+        if (!plans.empty()) {
+            text += "(";
+            for (size_t i = 0; i < plans.size(); i++) {
+                if (i > 0) text += ",";
+                text += plans[i];
+            }
+            text += ")";
+        }
+        text += "\n近200分钟 成功" + std::to_string(window_success) + " 失败" + std::to_string(window_failed);
+        if (cooling > 0) {
+            text += "\n限额冷却:" + std::to_string(cooling) + "个";
+        }
+        display->ShowNotification(text, 8000);
+    }
+
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
         return esp_io_expander_set_level(io_exp_handle, pin_mask, level);
     }
@@ -230,6 +392,19 @@ private:
         };
         ESP_ERROR_CHECK(iot_button_create(&m_btn_cfg, xio_m_btn_driver_, &m_btn_handle));
 
+        // 返回键（XIO_KEY_Q）：短按打断对话/查询用量，长按强制查询用量
+        q_key_active_high_ = IoExpanderGetLevel(XIO_KEY_Q) == 0;
+        button_driver_t* xio_q_btn_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
+        xio_q_btn_driver_->enable_power_save = false;
+        xio_q_btn_driver_->get_key_level = [](button_driver_t *button_driver) -> uint8_t {
+            if (instance_->q_key_active_high_) {
+                return instance_->IoExpanderGetLevel(XIO_KEY_Q);
+            }
+            return !instance_->IoExpanderGetLevel(XIO_KEY_Q);
+        };
+        button_handle_t q_btn_handle = NULL;
+        ESP_ERROR_CHECK(iot_button_create(&m_btn_cfg, xio_q_btn_driver_, &q_btn_handle));
+
         button_gpio_config_t r_cfg = {
             .gpio_num = R_BUTTON_GPIO,
             .active_level = BUTTON_INACTIVE,
@@ -276,6 +451,24 @@ private:
                 esp_io_expander_set_level(self->io_exp_handle, XIO_SYS_POW, 0);
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
+        }, this);
+
+        iot_button_register_cb(q_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
+            self->power_save_timer_->WakeUp();
+            auto& app = Application::GetInstance();
+            auto state = app.GetDeviceState();
+            if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+                app.ToggleChatState();
+            } else if (state == kDeviceStateIdle) {
+                self->StartChatGptUsageQuery();
+            }
+        }, this);
+
+        iot_button_register_cb(q_btn_handle, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
+            auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
+            self->power_save_timer_->WakeUp();
+            self->StartChatGptUsageQuery();
         }, this);
 
         iot_button_register_cb(r_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
