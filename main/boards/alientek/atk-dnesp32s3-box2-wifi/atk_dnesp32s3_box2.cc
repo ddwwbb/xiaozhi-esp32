@@ -28,6 +28,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <algorithm>
 #include <atomic>
 #include <string>
 #include <strings.h>
@@ -60,24 +61,37 @@ private:
     bool usage_config_mode_ = false;
     httpd_handle_t usage_config_server_ = nullptr;
     esp_timer_handle_t usage_config_exit_timer_ = nullptr;
+    // 单账号用量数据：remaining/reset 为 -1 表示查询失败
+    struct AccountDetail {
+        std::string email;
+        std::string plan;
+        std::string name;                // 邮箱前缀，无邮箱时为 账号N
+        std::string subscription_until;  // 订阅有效期（显示子串）
+        std::string last_refresh;        // Token 最近刷新（显示子串）
+        bool unavailable = false;
+        bool disabled = false;
+        long success_total = 0;
+        long failed_total = 0;
+        std::vector<std::pair<int, int>> buckets;  // 20×10min 桶：成功/失败
+        // api-call wham/usage 查询结果
+        int remaining_5h = -1;
+        int remaining_weekly = -1;
+        int remaining_cr = -1;  // 代码审查窗口
+        int reset_5h = -1;
+        int reset_weekly = -1;
+        int reset_cr = -1;
+        // 查询时需要
+        std::string auth_index;
+        std::string account_id;
+    };
+
     // Q 键查询结果的全屏用量面板（LVGL，用时创建、关闭即删除）
     lv_obj_t* usage_panel_ = nullptr;
     esp_timer_handle_t usage_panel_timer_ = nullptr;
-
-    struct CodexAccount {
-        std::string auth_index;
-        std::string account_id;
-        std::string email;
-        std::string plan;
-    };
-
-    // 单账号用量视图数据：remaining 为 -1 表示查询失败
-    struct AccountUsage {
-        std::string name;
-        std::string plan;
-        int remaining_5h = -1;
-        int remaining_weekly = -1;
-    };
+    // 面板数据缓存：列表页与详情页共用；-1 表示当前是列表页
+    std::vector<AccountDetail> usage_details_;
+    int usage_cooling_ = 0;
+    int usage_detail_index_ = -1;
 
     // 用量查询配置：NVS（vendor 命名空间）优先，Kconfig 为出厂默认
     struct CliproxyConfig {
@@ -448,7 +462,7 @@ private:
         int window_failed = 0;
         int cooling = 0;
         std::vector<std::string> plans;
-        std::vector<CodexAccount> codex_accounts;
+        std::vector<AccountDetail> details;
 
         cJSON* files = cJSON_GetObjectItem(root, "files");
         cJSON* file = nullptr;
@@ -463,21 +477,62 @@ private:
             }
             accounts++;
 
-            // recent_requests: 20 个 10 分钟桶，约 200 分钟窗口（provider 非 codex 时的回退显示）
-            cJSON* bucket = nullptr;
-            cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(file, "recent_requests")) {
-                window_success += GetJsonInt(bucket, "success");
-                window_failed += GetJsonInt(bucket, "failed");
-            }
-
-            bool unavailable = GetJsonBool(file, "unavailable") || GetJsonBool(file, "disabled");
-            if (unavailable) {
-                cooling++;
-            }
-
             cJSON* id_token = cJSON_GetObjectItem(file, "id_token");
             cJSON* plan_item = id_token ? cJSON_GetObjectItem(id_token, "plan_type") : nullptr;
             const char* plan = cJSON_IsString(plan_item) ? plan_item->valuestring : nullptr;
+
+            bool codex = strcasecmp(provider, "codex") == 0;
+            AccountDetail acc;
+            if (codex) {
+                cJSON* index_item = cJSON_GetObjectItem(file, "auth_index");
+                acc.auth_index = cJSON_IsString(index_item) ? index_item->valuestring : "";
+                cJSON* account_item = id_token ? cJSON_GetObjectItem(id_token, "chatgpt_account_id") : nullptr;
+                acc.account_id = cJSON_IsString(account_item) ? account_item->valuestring : "";
+            }
+
+            cJSON* email_item = cJSON_GetObjectItem(file, "email");
+            if (cJSON_IsString(email_item)) {
+                acc.email = email_item->valuestring;
+            }
+            if (plan != nullptr) {
+                acc.plan = plan;
+            }
+            acc.unavailable = GetJsonBool(file, "unavailable");
+            acc.disabled = GetJsonBool(file, "disabled");
+            if (acc.unavailable || acc.disabled) {
+                cooling++;
+            }
+            acc.success_total = GetJsonInt(file, "success");
+            acc.failed_total = GetJsonInt(file, "failed");
+
+            cJSON* bucket = nullptr;
+            cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(file, "recent_requests")) {
+                int s = GetJsonInt(bucket, "success");
+                int f = GetJsonInt(bucket, "failed");
+                window_success += s;
+                window_failed += f;
+                if (codex) {
+                    acc.buckets.emplace_back(s, f);
+                }
+            }
+
+            auto copy_display_substring = [](cJSON* parent, const char* key, size_t from, size_t len) {
+                cJSON* item = parent ? cJSON_GetObjectItem(parent, key) : nullptr;
+                if (!cJSON_IsString(item)) {
+                    return std::string();
+                }
+                std::string raw = item->valuestring;
+                return raw.substr(from, std::min(len, raw.size()));
+            };
+            acc.subscription_until = copy_display_substring(id_token, "chatgpt_subscription_active_until", 0, 10);
+            acc.last_refresh = copy_display_substring(file, "last_refresh", 5, 11);
+
+            size_t at = acc.email.find('@');
+            acc.name = at != std::string::npos ? acc.email.substr(0, at) : acc.email;
+            if (acc.name.size() > 16) {
+                acc.name.resize(16);
+            }
+
             if (plan != nullptr && plan[0] != '\0') {
                 bool exists = false;
                 for (auto& p : plans) {
@@ -491,28 +546,14 @@ private:
                 }
             }
 
-            cJSON* email_item = cJSON_GetObjectItem(file, "email");
             ESP_LOGI(TAG, "Usage: provider=%s email=%s plan=%s unavailable=%d",
                      provider,
-                     cJSON_IsString(email_item) ? email_item->valuestring : "-",
+                     acc.email.empty() ? "-" : acc.email.c_str(),
                      plan ? plan : "-",
-                     unavailable ? 1 : 0);
+                     acc.unavailable ? 1 : 0);
 
-            if (strcasecmp(provider, "codex") == 0) {
-                CodexAccount acc;
-                cJSON* index_item = cJSON_GetObjectItem(file, "auth_index");
-                acc.auth_index = cJSON_IsString(index_item) ? index_item->valuestring : "";
-                cJSON* account_item = id_token ? cJSON_GetObjectItem(id_token, "chatgpt_account_id") : nullptr;
-                acc.account_id = cJSON_IsString(account_item) ? account_item->valuestring : "";
-                if (cJSON_IsString(email_item)) {
-                    acc.email = email_item->valuestring;
-                }
-                if (plan != nullptr) {
-                    acc.plan = plan;
-                }
-                if (!acc.auth_index.empty() && !acc.account_id.empty()) {
-                    codex_accounts.push_back(acc);
-                }
+            if (codex && !acc.auth_index.empty() && !acc.account_id.empty()) {
+                details.push_back(std::move(acc));
             }
         }
         cJSON_Delete(root);
@@ -527,8 +568,8 @@ private:
             return;
         }
 
-        if (strcasecmp(provider_filter, "codex") == 0 && !codex_accounts.empty()) {
-            ShowCodexRemaining(base_url, management_key, codex_accounts, plans, cooling);
+        if (strcasecmp(provider_filter, "codex") == 0 && !details.empty()) {
+            ShowCodexRemaining(base_url, management_key, details, plans, cooling);
             return;
         }
 
@@ -583,21 +624,16 @@ private:
     }
 
     // 通过 POST /v0/management/api-call 用账号令牌代呼
-    // https://chatgpt.com/backend-api/wham/usage，返回 5h/每周剩余百分比
+    // https://chatgpt.com/backend-api/wham/usage，填充 5h/每周/代码审查窗口
     static bool FetchCodexRemaining(const std::string& base_url, const std::string& management_key,
-                                    const std::string& auth_index, const std::string& account_id,
-                                    int& remaining_5h, int& remaining_weekly, int& reset_5h_seconds) {
-        remaining_5h = -1;
-        remaining_weekly = -1;
-        reset_5h_seconds = -1;
-
+                                    AccountDetail& acc) {
         cJSON* header = cJSON_CreateObject();
         cJSON_AddStringToObject(header, "Authorization", "Bearer $TOKEN$");
         cJSON_AddStringToObject(header, "Content-Type", "application/json");
         cJSON_AddStringToObject(header, "User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal");
-        cJSON_AddStringToObject(header, "Chatgpt-Account-Id", account_id.c_str());
+        cJSON_AddStringToObject(header, "Chatgpt-Account-Id", acc.account_id.c_str());
         cJSON* request = cJSON_CreateObject();
-        cJSON_AddStringToObject(request, "auth_index", auth_index.c_str());
+        cJSON_AddStringToObject(request, "auth_index", acc.auth_index.c_str());
         cJSON_AddStringToObject(request, "method", "GET");
         cJSON_AddStringToObject(request, "url", "https://chatgpt.com/backend-api/wham/usage");
         cJSON_AddItemToObject(request, "header", header);
@@ -623,7 +659,7 @@ private:
         std::string body = status == 200 ? http->ReadAll() : "";
         http->Close();
         if (status != 200) {
-            ESP_LOGE(TAG, "api-call: HTTP %d (auth_index=%s)", status, auth_index.c_str());
+            ESP_LOGE(TAG, "api-call: HTTP %d (auth_index=%s)", status, acc.auth_index.c_str());
             return false;
         }
 
@@ -645,13 +681,19 @@ private:
         cJSON* rate_limit = cJSON_GetObjectItem(usage, "rate_limit");
         cJSON* primary = rate_limit ? cJSON_GetObjectItem(rate_limit, "primary_window") : nullptr;
         cJSON* secondary = rate_limit ? cJSON_GetObjectItem(rate_limit, "secondary_window") : nullptr;
-        remaining_5h = WindowRemainingPct(primary);
-        remaining_weekly = WindowRemainingPct(secondary);
-        reset_5h_seconds = WindowResetSeconds(primary);
-        ESP_LOGI(TAG, "Codex usage: auth_index=%s 5h=%d%% weekly=%d%% reset=%ds",
-                 auth_index.c_str(), remaining_5h, remaining_weekly, reset_5h_seconds);
+        cJSON* cr_limit = cJSON_GetObjectItem(usage, "code_review_rate_limit");
+        cJSON* cr_primary = cr_limit ? cJSON_GetObjectItem(cr_limit, "primary_window") : nullptr;
+        acc.remaining_5h = WindowRemainingPct(primary);
+        acc.remaining_weekly = WindowRemainingPct(secondary);
+        acc.remaining_cr = WindowRemainingPct(cr_primary);
+        acc.reset_5h = WindowResetSeconds(primary);
+        acc.reset_weekly = WindowResetSeconds(secondary);
+        acc.reset_cr = WindowResetSeconds(cr_primary);
+        ESP_LOGI(TAG, "Codex usage: %s 5h=%d%%(%ds) weekly=%d%%(%ds) cr=%d%%(%ds)",
+                 acc.name.c_str(), acc.remaining_5h, acc.reset_5h, acc.remaining_weekly, acc.reset_weekly,
+                 acc.remaining_cr, acc.reset_cr);
         cJSON_Delete(usage);
-        return remaining_5h >= 0 || remaining_weekly >= 0;
+        return acc.remaining_5h >= 0 || acc.remaining_weekly >= 0;
     }
 
     static lv_color_t UsageBarColor(int remaining_pct) {
@@ -671,6 +713,7 @@ private:
         if (usage_panel_timer_ != nullptr) {
             esp_timer_stop(usage_panel_timer_);
         }
+        usage_detail_index_ = -1;
         if (usage_panel_ == nullptr) {
             return;
         }
@@ -782,7 +825,7 @@ private:
         lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "%").c_str() : "?");
     }
 
-    void AddUsageCard(lv_obj_t* parent, const AccountUsage& usage) {
+    void AddUsageCard(lv_obj_t* parent, const AccountDetail& acc) {
         auto display = GetDisplay();
         auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
 
@@ -813,9 +856,9 @@ private:
         lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
         lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name_label, 130);
-        lv_label_set_text(name_label, usage.name.c_str());
+        lv_label_set_text(name_label, acc.name.c_str());
 
-        if (!usage.plan.empty()) {
+        if (!acc.plan.empty()) {
             lv_obj_t* plan_label = lv_label_create(title_row);
             lv_obj_set_style_text_font(plan_label, font, 0);
             lv_obj_set_style_text_color(plan_label, lv_color_hex(0x8AB4F8), 0);
@@ -824,11 +867,11 @@ private:
             lv_obj_set_style_radius(plan_label, 6, 0);
             lv_obj_set_style_pad_hor(plan_label, 8, 0);
             lv_obj_set_style_pad_ver(plan_label, 2, 0);
-            lv_label_set_text(plan_label, usage.plan.c_str());
+            lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
-        AddUsageBarRow(card, "5h", usage.remaining_5h);
-        AddUsageBarRow(card, "周", usage.remaining_weekly);
+        AddUsageBarRow(card, "5h", acc.remaining_5h);
+        AddUsageBarRow(card, "周", acc.remaining_weekly);
     }
 
     void ShowUsagePanelLoading() {
@@ -846,49 +889,284 @@ private:
         RestartUsagePanelTimer(25000000LL);
     }
 
+    static std::string FormatResetLabel(int seconds) {
+        if (seconds <= 0) {
+            return "";
+        }
+        char label[32];
+        if (seconds >= 86400) {
+            snprintf(label, sizeof(label), "%d日%d时后重置", seconds / 86400, (seconds % 86400) / 3600);
+        } else if (seconds >= 3600) {
+            snprintf(label, sizeof(label), "%.1f时后重置", seconds / 3600.0);
+        } else {
+            snprintf(label, sizeof(label), "%d分后重置", seconds / 60);
+        }
+        return label;
+    }
+
+    // 详情页：一栏标签行（窗口名 + 重置倒计时）+ 大进度条
+    void AddDetailBarBlock(lv_obj_t* parent, const char* title, int remaining_pct, int reset_seconds) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        lv_obj_t* head = lv_obj_create(parent);
+        lv_obj_set_width(head, lv_pct(100));
+        lv_obj_set_height(head, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(head, 0, 0);
+        lv_obj_set_style_pad_all(head, 0, 0);
+        lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* title_label = lv_label_create(head);
+        lv_obj_set_style_text_font(title_label, font, 0);
+        lv_obj_set_style_text_color(title_label, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(title_label, title);
+
+        if (reset_seconds > 0) {
+            lv_obj_t* reset_label = lv_label_create(head);
+            lv_obj_set_style_text_font(reset_label, font, 0);
+            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(reset_label, FormatResetLabel(reset_seconds).c_str());
+        }
+
+        lv_obj_t* bar = lv_bar_create(parent);
+        lv_obj_set_width(bar, lv_pct(100));
+        lv_obj_set_height(bar, 14);
+        lv_bar_set_range(bar, 0, 100);
+        lv_bar_set_value(bar, remaining_pct >= 0 ? remaining_pct : 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0x2A2F36), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, UsageBarColor(remaining_pct), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
+
+        lv_obj_t* pct_label = lv_label_create(parent);
+        lv_obj_set_style_text_font(pct_label, font, 0);
+        lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
+        lv_obj_set_width(pct_label, lv_pct(100));
+        lv_obj_set_style_text_align(pct_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
+    }
+
+    // 近 200 分钟请求分布：20 桶迷你柱状图（下绿=成功，上红=失败）
+    void AddUsageBucketsChart(lv_obj_t* parent, const std::vector<std::pair<int, int>>& buckets) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        lv_obj_t* chart = lv_obj_create(parent);
+        lv_obj_set_width(chart, lv_pct(100));
+        lv_obj_set_height(chart, 36);
+        lv_obj_set_style_bg_color(chart, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(chart, 8, 0);
+        lv_obj_set_style_border_width(chart, 0, 0);
+        lv_obj_set_style_pad_hor(chart, 4, 0);
+        lv_obj_set_style_pad_ver(chart, 3, 0);
+        lv_obj_set_style_pad_column(chart, 2, 0);
+        lv_obj_set_flex_flow(chart, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(chart, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+        lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+
+        int max_value = 1;
+        for (auto& bucket : buckets) {
+            max_value = std::max(max_value, bucket.first + bucket.second);
+        }
+        for (auto& bucket : buckets) {
+            lv_obj_t* column = lv_obj_create(chart);
+            lv_obj_set_width(column, 6);
+            lv_obj_set_height(column, 30);
+            lv_obj_set_style_bg_opa(column, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(column, 0, 0);
+            lv_obj_set_style_pad_all(column, 0, 0);
+            lv_obj_set_style_pad_row(column, 0, 0);
+            lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(column, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+            lv_obj_clear_flag(column, LV_OBJ_FLAG_SCROLLABLE);
+
+            int failed_h = bucket.second * 30 / max_value;
+            int success_h = bucket.first * 30 / max_value;
+            if (failed_h > 0) {
+                lv_obj_t* failed_bar = lv_obj_create(column);
+                lv_obj_set_size(failed_bar, 6, failed_h);
+                lv_obj_set_style_bg_color(failed_bar, lv_color_hex(0xEA4335), 0);
+                lv_obj_set_style_bg_opa(failed_bar, LV_OPA_COVER, 0);
+                lv_obj_set_style_radius(failed_bar, 1, 0);
+                lv_obj_set_style_border_width(failed_bar, 0, 0);
+            }
+            if (success_h > 0) {
+                lv_obj_t* success_bar = lv_obj_create(column);
+                lv_obj_set_size(success_bar, 6, success_h);
+                lv_obj_set_style_bg_color(success_bar, lv_color_hex(0x34A853), 0);
+                lv_obj_set_style_bg_opa(success_bar, LV_OPA_COVER, 0);
+                lv_obj_set_style_radius(success_bar, 1, 0);
+                lv_obj_set_style_border_width(success_bar, 0, 0);
+            }
+            if (failed_h == 0 && success_h == 0) {
+                lv_obj_t* empty_bar = lv_obj_create(column);
+                lv_obj_set_size(empty_bar, 6, 2);
+                lv_obj_set_style_bg_color(empty_bar, lv_color_hex(0x2A2F36), 0);
+                lv_obj_set_style_bg_opa(empty_bar, LV_OPA_COVER, 0);
+                lv_obj_set_style_radius(empty_bar, 1, 0);
+                lv_obj_set_style_border_width(empty_bar, 0, 0);
+            }
+        }
+        (void)font;
+    }
+
+    void AddDetailInfoLine(lv_obj_t* parent, const std::string& text, uint32_t color) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        lv_obj_t* label = lv_label_create(parent);
+        lv_obj_set_style_text_font(label, font, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_text(label, text.c_str());
+    }
+
+    // M 键从列表进入的单账号详情页；数据来自 usage_details_ 缓存
+    void ShowUsageDetailPanel(int index) {
+        if (usage_details_.empty()) {
+            return;
+        }
+        index = ((index % (int)usage_details_.size()) + (int)usage_details_.size()) % (int)usage_details_.size();
+        usage_detail_index_ = index;
+        const AccountDetail& acc = usage_details_[index];
+
+        std::string subtitle = "< " + std::to_string(index + 1) + "/" + std::to_string(usage_details_.size()) +
+                               " >  音量键切换";
+        lv_obj_t* content = CreateUsagePanelBase("账号详情", subtitle.c_str());
+        if (content == nullptr) {
+            GetDisplay()->ShowNotification("详情页创建失败", 3000);
+            return;
+        }
+
+        DisplayLockGuard lock(GetDisplay());
+        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
+
+        // 邮箱 + 套餐徽章
+        lv_obj_t* title_row = lv_obj_create(content);
+        lv_obj_set_width(title_row, lv_pct(100));
+        lv_obj_set_height(title_row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_style_pad_column(title_row, 6, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* email_label = lv_label_create(title_row);
+        lv_obj_set_style_text_font(email_label, font, 0);
+        lv_obj_set_style_text_color(email_label, lv_color_hex(0xE8EAED), 0);
+        lv_label_set_long_mode(email_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_flex_grow(email_label, 1);
+        lv_label_set_text(email_label, acc.email.empty() ? acc.name.c_str() : acc.email.c_str());
+
+        if (!acc.plan.empty()) {
+            lv_obj_t* plan_label = lv_label_create(title_row);
+            lv_obj_set_style_text_font(plan_label, font, 0);
+            lv_obj_set_style_text_color(plan_label, lv_color_hex(0x8AB4F8), 0);
+            lv_obj_set_style_bg_color(plan_label, lv_color_hex(0x283142), 0);
+            lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(plan_label, 6, 0);
+            lv_obj_set_style_pad_hor(plan_label, 8, 0);
+            lv_obj_set_style_pad_ver(plan_label, 2, 0);
+            lv_label_set_text(plan_label, acc.plan.c_str());
+        }
+
+        if (!acc.subscription_until.empty()) {
+            AddDetailInfoLine(content, "订阅有效至 " + acc.subscription_until, 0x9AA0A6);
+        }
+
+        // 三个限额窗口
+        AddDetailBarBlock(content, "5小时窗口", acc.remaining_5h, acc.reset_5h);
+        AddDetailBarBlock(content, "每周窗口", acc.remaining_weekly, acc.reset_weekly);
+        if (acc.remaining_cr >= 0) {
+            AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
+        }
+
+        // 近 200 分钟请求分布 + 累计
+        AddDetailInfoLine(content, "近200分钟请求(绿成功/红失败)", 0x9AA0A6);
+        AddUsageBucketsChart(content, acc.buckets);
+        AddDetailInfoLine(content,
+                          "累计 成功" + std::to_string(acc.success_total) + " 失败" + std::to_string(acc.failed_total),
+                          0x9AA0A6);
+
+        if (!acc.last_refresh.empty()) {
+            AddDetailInfoLine(content, "Token刷新 " + acc.last_refresh, 0x9AA0A6);
+        }
+        if (acc.disabled) {
+            AddDetailInfoLine(content, "状态: 已禁用", 0xEA4335);
+        } else if (acc.unavailable) {
+            AddDetailInfoLine(content, "状态: 限额冷却中", 0xFBBC04);
+        }
+
+        RestartUsagePanelTimer(30000000LL);
+    }
+
+    // M 键在详情页再按时回到列表
+    void BackToUsageList() {
+        if (usage_details_.empty()) {
+            HideUsagePanel();
+            return;
+        }
+        int min_remaining = 101;
+        int min_reset = -1;
+        for (auto& acc : usage_details_) {
+            if (acc.remaining_5h >= 0 && acc.remaining_5h < min_remaining) {
+                min_remaining = acc.remaining_5h;
+                min_reset = acc.reset_5h;
+            }
+        }
+        std::string subtitle = std::to_string(usage_details_.size()) + "账号";
+        if (min_reset > 0) {
+            subtitle += " · " + FormatResetLabel(min_reset) + "(最紧)";
+        }
+        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
+        if (content == nullptr) {
+            HideUsagePanel();
+            return;
+        }
+        usage_detail_index_ = -1;
+        DisplayLockGuard lock(GetDisplay());
+        for (auto& acc : usage_details_) {
+            AddUsageCard(content, acc);
+        }
+        if (usage_cooling_ > 0) {
+            AddDetailInfoLine(content, "限额冷却:" + std::to_string(usage_cooling_) + "个账号", 0xFBBC04);
+        }
+        RestartUsagePanelTimer(15000000LL);
+    }
+
     void ShowCodexRemaining(const std::string& base_url, const std::string& management_key,
-                            const std::vector<CodexAccount>& accounts, std::vector<std::string>& plans,
-                            int cooling) {
+                            std::vector<AccountDetail>& details, std::vector<std::string>& plans, int cooling) {
         // 逐账号出站查询较慢，最多查 4 个账号
         const size_t kMaxQueried = 4;
-        std::vector<AccountUsage> usages;
         int min_remaining = 101;  // 最紧张账号的剩余与重置时间
         int min_reset = -1;
         int failed = 0;
 
-        for (size_t i = 0; i < accounts.size() && i < kMaxQueried; i++) {
-            AccountUsage usage;
-            usage.plan = accounts[i].plan;
-            size_t at = accounts[i].email.find('@');
-            usage.name = at != std::string::npos ? accounts[i].email.substr(0, at) : accounts[i].email;
-            if (usage.name.empty()) {
-                usage.name = "账号" + std::to_string(i + 1);
-            }
-            if (usage.name.size() > 16) {
-                usage.name.resize(16);
-            }
-
-            int reset_5h = -1;
-            if (!FetchCodexRemaining(base_url, management_key, accounts[i].auth_index,
-                                     accounts[i].account_id, usage.remaining_5h, usage.remaining_weekly,
-                                     reset_5h)) {
+        for (size_t i = 0; i < details.size() && i < kMaxQueried; i++) {
+            if (!FetchCodexRemaining(base_url, management_key, details[i])) {
                 failed++;
             }
-            if (usage.remaining_5h >= 0 && usage.remaining_5h < min_remaining) {
-                min_remaining = usage.remaining_5h;
-                min_reset = reset_5h;
+            if (details[i].remaining_5h >= 0 && details[i].remaining_5h < min_remaining) {
+                min_remaining = details[i].remaining_5h;
+                min_reset = details[i].reset_5h;
             }
-            usages.push_back(std::move(usage));
         }
 
-        if (usages.empty() || failed == usages.size()) {
+        if (details.empty() || failed == (int)std::min(details.size(), kMaxQueried)) {
             HideUsagePanel();
             GetDisplay()->ShowNotification("剩余用量查询失败:api-call不可用", 3000);
             return;
         }
 
         // 副标题：账号数 + 套餐 + 最紧张账号的重置倒计时
-        std::string subtitle = std::to_string(accounts.size()) + "账号";
+        std::string subtitle = std::to_string(details.size()) + "账号";
         if (!plans.empty()) {
             subtitle += " · ";
             for (size_t i = 0; i < plans.size(); i++) {
@@ -897,14 +1175,12 @@ private:
             }
         }
         if (min_reset > 0) {
-            char reset_label[32];
-            if (min_reset >= 3600) {
-                snprintf(reset_label, sizeof(reset_label), " · 最紧%.1f时重置", min_reset / 3600.0);
-            } else {
-                snprintf(reset_label, sizeof(reset_label), " · 最紧%d分重置", min_reset / 60);
-            }
-            subtitle += reset_label;
+            subtitle += " · " + FormatResetLabel(min_reset) + "(最紧)";
         }
+
+        usage_details_ = std::move(details);
+        usage_cooling_ = cooling;
+        usage_detail_index_ = -1;
 
         lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
         if (content == nullptr) {
@@ -913,15 +1189,11 @@ private:
         }
 
         DisplayLockGuard lock(GetDisplay());
-        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
-        for (auto& usage : usages) {
-            AddUsageCard(content, usage);
+        for (auto& acc : usage_details_) {
+            AddUsageCard(content, acc);
         }
         if (cooling > 0) {
-            lv_obj_t* warn = lv_label_create(content);
-            lv_obj_set_style_text_font(warn, font, 0);
-            lv_obj_set_style_text_color(warn, lv_color_hex(0xFBBC04), 0);
-            lv_label_set_text(warn, ("限额冷却:" + std::to_string(cooling) + "个账号").c_str());
+            AddDetailInfoLine(content, "限额冷却:" + std::to_string(cooling) + "个账号", 0xFBBC04);
         }
         RestartUsagePanelTimer(15000000LL);
     }
@@ -1034,6 +1306,10 @@ private:
         iot_button_register_cb(l_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
+            if (self->usage_detail_index_ >= 0) {
+                self->ShowUsageDetailPanel(self->usage_detail_index_ - 1);
+                return;
+            }
             self->audio_volume_change(false);
         }, this);
 
@@ -1046,6 +1322,14 @@ private:
         iot_button_register_cb(m_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
+            if (!self->usage_config_mode_ && self->usage_panel_ != nullptr) {
+                if (self->usage_detail_index_ >= 0) {
+                    self->BackToUsageList();
+                } else {
+                    self->ShowUsageDetailPanel(0);
+                }
+                return;
+            }
             auto& app = Application::GetInstance();
             app.ToggleChatState();
         }, this);
@@ -1103,6 +1387,10 @@ private:
         iot_button_register_cb(r_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
+            if (self->usage_detail_index_ >= 0) {
+                self->ShowUsageDetailPanel(self->usage_detail_index_ + 1);
+                return;
+            }
             self->audio_volume_change(true);
         }, this);
 
