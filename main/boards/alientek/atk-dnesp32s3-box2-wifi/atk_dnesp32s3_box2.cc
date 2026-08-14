@@ -13,6 +13,8 @@
 #include "i2c_device.h"
 #include "sdkconfig.h"
 #include "settings.h"
+#include "lvgl_theme.h"
+#include <lvgl.h>
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <esp_http_server.h>
@@ -58,10 +60,23 @@ private:
     bool usage_config_mode_ = false;
     httpd_handle_t usage_config_server_ = nullptr;
     esp_timer_handle_t usage_config_exit_timer_ = nullptr;
+    // Q 键查询结果的全屏用量面板（LVGL，用时创建、关闭即删除）
+    lv_obj_t* usage_panel_ = nullptr;
+    esp_timer_handle_t usage_panel_timer_ = nullptr;
 
     struct CodexAccount {
         std::string auth_index;
         std::string account_id;
+        std::string email;
+        std::string plan;
+    };
+
+    // 单账号用量视图数据：remaining 为 -1 表示查询失败
+    struct AccountUsage {
+        std::string name;
+        std::string plan;
+        int remaining_5h = -1;
+        int remaining_weekly = -1;
     };
 
     // 用量查询配置：NVS（vendor 命名空间）优先，Kconfig 为出厂默认
@@ -311,6 +326,7 @@ private:
         if (usage_config_mode_) {
             return;
         }
+        HideUsagePanel();
         std::string ip = GetLocalIpAddress();
         if (ip.empty()) {
             GetDisplay()->ShowNotification("网络未连接,无法配置", 3000);
@@ -389,7 +405,7 @@ private:
             return;
         }
 
-        display->ShowNotification("查询套餐用量...", 30000);
+        ShowUsagePanelLoading();
 
         std::string url = base_url + "/v0/management/auth-files";
         auto http = GetNetwork()->CreateHttp(0);
@@ -398,6 +414,7 @@ private:
         http->SetHeader("Accept", "application/json");
         if (!http->Open("GET", url)) {
             ESP_LOGE(TAG, "Usage query: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
+            HideUsagePanel();
             display->ShowNotification("用量查询失败:无法连接", 3000);
             return;
         }
@@ -413,12 +430,14 @@ private:
             } else if (status == 404) {
                 reason = "查询失败:管理接口未启用(404)";
             }
+            HideUsagePanel();
             display->ShowNotification(reason, 3000);
             return;
         }
 
         cJSON* root = cJSON_Parse(body.c_str());
         if (root == nullptr) {
+            HideUsagePanel();
             display->ShowNotification("用量查询失败:响应解析错误", 3000);
             return;
         }
@@ -485,6 +504,12 @@ private:
                 acc.auth_index = cJSON_IsString(index_item) ? index_item->valuestring : "";
                 cJSON* account_item = id_token ? cJSON_GetObjectItem(id_token, "chatgpt_account_id") : nullptr;
                 acc.account_id = cJSON_IsString(account_item) ? account_item->valuestring : "";
+                if (cJSON_IsString(email_item)) {
+                    acc.email = email_item->valuestring;
+                }
+                if (plan != nullptr) {
+                    acc.plan = plan;
+                }
                 if (!acc.auth_index.empty() && !acc.account_id.empty()) {
                     codex_accounts.push_back(acc);
                 }
@@ -497,6 +522,7 @@ private:
             label = strcasecmp(provider_filter, "codex") == 0 ? "ChatGPT" : provider_filter;
         }
         if (accounts == 0) {
+            HideUsagePanel();
             display->ShowNotification("无" + label + "账号凭证", 3000);
             return;
         }
@@ -519,6 +545,7 @@ private:
         if (cooling > 0) {
             text += "\n限额冷却:" + std::to_string(cooling) + "个";
         }
+        HideUsagePanel();
         display->ShowNotification(text, 8000);
     }
 
@@ -627,68 +654,276 @@ private:
         return remaining_5h >= 0 || remaining_weekly >= 0;
     }
 
+    static lv_color_t UsageBarColor(int remaining_pct) {
+        if (remaining_pct < 0) {
+            return lv_color_hex(0x5F6368);
+        }
+        if (remaining_pct < 25) {
+            return lv_color_hex(0xEA4335);
+        }
+        if (remaining_pct < 50) {
+            return lv_color_hex(0xFBBC04);
+        }
+        return lv_color_hex(0x34A853);
+    }
+
+    void HideUsagePanel() {
+        if (usage_panel_timer_ != nullptr) {
+            esp_timer_stop(usage_panel_timer_);
+        }
+        if (usage_panel_ == nullptr) {
+            return;
+        }
+        DisplayLockGuard lock(GetDisplay());
+        lv_obj_delete(usage_panel_);
+        usage_panel_ = nullptr;
+    }
+
+    void RestartUsagePanelTimer(int64_t timeout_us) {
+        if (usage_panel_timer_ == nullptr) {
+            esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) { instance_->HideUsagePanel(); },
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "usage_panel_hide",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &usage_panel_timer_));
+        }
+        esp_timer_stop(usage_panel_timer_);
+        esp_timer_start_once(usage_panel_timer_, timeout_us);
+    }
+
+    // 创建面板骨架（深色全屏 + 标题），返回内容容器；UI 未就绪时返回 nullptr
+    lv_obj_t* CreateUsagePanelBase(const char* title, const char* subtitle) {
+        HideUsagePanel();
+        auto display = GetDisplay();
+        if (display->GetTheme() == nullptr) {
+            return nullptr;
+        }
+        DisplayLockGuard lock(display);
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        usage_panel_ = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(usage_panel_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_add_flag(usage_panel_, LV_OBJ_FLAG_FLOATING);
+        lv_obj_move_foreground(usage_panel_);
+        lv_obj_set_style_bg_color(usage_panel_, lv_color_hex(0x101418), 0);
+        lv_obj_set_style_bg_opa(usage_panel_, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(usage_panel_, 0, 0);
+        lv_obj_set_style_border_width(usage_panel_, 0, 0);
+        lv_obj_set_style_pad_all(usage_panel_, 10, 0);
+        lv_obj_set_flex_flow(usage_panel_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(usage_panel_, 6, 0);
+        lv_obj_clear_flag(usage_panel_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_text_font(usage_panel_, font, 0);
+
+        lv_obj_t* header = lv_label_create(usage_panel_);
+        lv_obj_set_style_text_color(header, lv_color_hex(0xE8EAED), 0);
+        lv_label_set_text(header, title);
+
+        if (subtitle != nullptr && subtitle[0] != '\0') {
+            lv_obj_t* sub = lv_label_create(usage_panel_);
+            lv_obj_set_style_text_color(sub, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(sub, subtitle);
+        }
+
+        lv_obj_t* content = lv_obj_create(usage_panel_);
+        lv_obj_set_width(content, lv_pct(100));
+        lv_obj_set_flex_grow(content, 1);
+        lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(content, 0, 0);
+        lv_obj_set_style_pad_all(content, 0, 0);
+        lv_obj_set_style_pad_row(content, 6, 0);
+        lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+        return content;
+    }
+
+    // 一行进度条：标签 + 彩条 + 百分比
+    void AddUsageBarRow(lv_obj_t* parent, const char* tag, int remaining_pct) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        lv_obj_t* row = lv_obj_create(parent);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* tag_label = lv_label_create(row);
+        lv_obj_set_style_text_font(tag_label, font, 0);
+        lv_obj_set_style_text_color(tag_label, lv_color_hex(0x9AA0A6), 0);
+        lv_obj_set_width(tag_label, 26);
+        lv_label_set_text(tag_label, tag);
+
+        lv_obj_t* bar = lv_bar_create(row);
+        lv_obj_set_height(bar, 10);
+        lv_obj_set_flex_grow(bar, 1);
+        lv_bar_set_range(bar, 0, 100);
+        lv_bar_set_value(bar, remaining_pct >= 0 ? remaining_pct : 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0x2A2F36), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(bar, UsageBarColor(remaining_pct), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(bar, 3, LV_PART_MAIN);
+        lv_obj_set_style_radius(bar, 3, LV_PART_INDICATOR);
+
+        lv_obj_t* pct_label = lv_label_create(row);
+        lv_obj_set_style_text_font(pct_label, font, 0);
+        lv_obj_set_style_text_color(pct_label, lv_color_hex(0xE8EAED), 0);
+        lv_obj_set_width(pct_label, 42);
+        lv_obj_set_style_text_align(pct_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "%").c_str() : "?");
+    }
+
+    void AddUsageCard(lv_obj_t* parent, const AccountUsage& usage) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        lv_obj_t* card = lv_obj_create(parent);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_border_width(card, 0, 0);
+        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_style_pad_row(card, 6, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* title_row = lv_obj_create(card);
+        lv_obj_set_width(title_row, lv_pct(100));
+        lv_obj_set_height(title_row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* name_label = lv_label_create(title_row);
+        lv_obj_set_style_text_font(name_label, font, 0);
+        lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
+        lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_label, 130);
+        lv_label_set_text(name_label, usage.name.c_str());
+
+        if (!usage.plan.empty()) {
+            lv_obj_t* plan_label = lv_label_create(title_row);
+            lv_obj_set_style_text_font(plan_label, font, 0);
+            lv_obj_set_style_text_color(plan_label, lv_color_hex(0x8AB4F8), 0);
+            lv_obj_set_style_bg_color(plan_label, lv_color_hex(0x283142), 0);
+            lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(plan_label, 6, 0);
+            lv_obj_set_style_pad_hor(plan_label, 8, 0);
+            lv_obj_set_style_pad_ver(plan_label, 2, 0);
+            lv_label_set_text(plan_label, usage.plan.c_str());
+        }
+
+        AddUsageBarRow(card, "5h", usage.remaining_5h);
+        AddUsageBarRow(card, "周", usage.remaining_weekly);
+    }
+
+    void ShowUsagePanelLoading() {
+        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
+        if (content == nullptr) {
+            GetDisplay()->ShowNotification("查询套餐用量...", 8000);
+            return;
+        }
+        DisplayLockGuard lock(GetDisplay());
+        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
+        lv_obj_t* loading = lv_label_create(content);
+        lv_obj_set_style_text_font(loading, font, 0);
+        lv_obj_set_style_text_color(loading, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(loading, "查询中...");
+        RestartUsagePanelTimer(25000000LL);
+    }
+
     void ShowCodexRemaining(const std::string& base_url, const std::string& management_key,
                             const std::vector<CodexAccount>& accounts, std::vector<std::string>& plans,
                             int cooling) {
         // 逐账号出站查询较慢，最多查 4 个账号
         const size_t kMaxQueried = 4;
-        std::string line_5h = "5h余:";
-        std::string line_weekly = "周余:";
+        std::vector<AccountUsage> usages;
         int min_remaining = 101;  // 最紧张账号的剩余与重置时间
         int min_reset = -1;
-        int queried = 0;
         int failed = 0;
 
         for (size_t i = 0; i < accounts.size() && i < kMaxQueried; i++) {
-            int remaining_5h = -1;
-            int remaining_weekly = -1;
+            AccountUsage usage;
+            usage.plan = accounts[i].plan;
+            size_t at = accounts[i].email.find('@');
+            usage.name = at != std::string::npos ? accounts[i].email.substr(0, at) : accounts[i].email;
+            if (usage.name.empty()) {
+                usage.name = "账号" + std::to_string(i + 1);
+            }
+            if (usage.name.size() > 16) {
+                usage.name.resize(16);
+            }
+
             int reset_5h = -1;
             if (!FetchCodexRemaining(base_url, management_key, accounts[i].auth_index,
-                                     accounts[i].account_id, remaining_5h, remaining_weekly, reset_5h)) {
+                                     accounts[i].account_id, usage.remaining_5h, usage.remaining_weekly,
+                                     reset_5h)) {
                 failed++;
             }
-            if (queried > 0) {
-                line_5h += "|";
-                line_weekly += "|";
-            }
-            line_5h += remaining_5h >= 0 ? std::to_string(remaining_5h) + "%" : "?";
-            line_weekly += remaining_weekly >= 0 ? std::to_string(remaining_weekly) + "%" : "?";
-            if (remaining_5h >= 0 && remaining_5h < min_remaining) {
-                min_remaining = remaining_5h;
+            if (usage.remaining_5h >= 0 && usage.remaining_5h < min_remaining) {
+                min_remaining = usage.remaining_5h;
                 min_reset = reset_5h;
             }
-            queried++;
+            usages.push_back(std::move(usage));
         }
 
-        if (queried == 0 || (failed == queried)) {
+        if (usages.empty() || failed == usages.size()) {
+            HideUsagePanel();
             GetDisplay()->ShowNotification("剩余用量查询失败:api-call不可用", 3000);
             return;
         }
 
-        std::string text = "ChatGPT:" + std::to_string(accounts.size()) + "个";
+        // 副标题：账号数 + 套餐 + 最紧张账号的重置倒计时
+        std::string subtitle = std::to_string(accounts.size()) + "账号";
         if (!plans.empty()) {
-            text += "(";
+            subtitle += " · ";
             for (size_t i = 0; i < plans.size(); i++) {
-                if (i > 0) text += ",";
-                text += plans[i];
+                if (i > 0) subtitle += ",";
+                subtitle += plans[i];
             }
-            text += ")";
         }
-        text += "\n" + line_5h;
         if (min_reset > 0) {
-            char reset_label[24];
+            char reset_label[32];
             if (min_reset >= 3600) {
-                snprintf(reset_label, sizeof(reset_label), " %.1f时重置", min_reset / 3600.0);
+                snprintf(reset_label, sizeof(reset_label), " · 最紧%.1f时重置", min_reset / 3600.0);
             } else {
-                snprintf(reset_label, sizeof(reset_label), " %d分重置", min_reset / 60);
+                snprintf(reset_label, sizeof(reset_label), " · 最紧%d分重置", min_reset / 60);
             }
-            text += reset_label;
+            subtitle += reset_label;
         }
-        text += "\n" + line_weekly;
+
+        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
+        if (content == nullptr) {
+            GetDisplay()->ShowNotification("用量面板创建失败", 3000);
+            return;
+        }
+
+        DisplayLockGuard lock(GetDisplay());
+        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
+        for (auto& usage : usages) {
+            AddUsageCard(content, usage);
+        }
         if (cooling > 0) {
-            text += "\n限额冷却:" + std::to_string(cooling) + "个";
+            lv_obj_t* warn = lv_label_create(content);
+            lv_obj_set_style_text_font(warn, font, 0);
+            lv_obj_set_style_text_color(warn, lv_color_hex(0xFBBC04), 0);
+            lv_label_set_text(warn, ("限额冷却:" + std::to_string(cooling) + "个账号").c_str());
         }
-        GetDisplay()->ShowNotification(text, 8000);
+        RestartUsagePanelTimer(15000000LL);
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
@@ -847,7 +1082,11 @@ private:
             if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
                 app.ToggleChatState();
             } else if (state == kDeviceStateIdle) {
-                self->StartChatGptUsageQuery();
+                if (self->usage_panel_ != nullptr) {
+                    self->HideUsagePanel();
+                } else {
+                    self->StartChatGptUsageQuery();
+                }
             }
         }, this);
 
