@@ -3,7 +3,6 @@ name: Build Boards
 on:
   push:
     branches:
-      - main
       - ci/* # for ci test
   pull_request:
     branches:

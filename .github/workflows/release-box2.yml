@@ -1,0 +1,71 @@
+name: Release Box2 Firmware
+
+# 只编译 atk-dnesp32s3-box2-wifi 一块板，并发布到 Releases（滚动更新 box2-latest）
+on:
+  push:
+    branches:
+      - main
+      - feat/box2-wifi-return-key-usage
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（留空 = box2-latest 滚动更新）'
+        required: false
+        default: 'box2-latest'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build box2-wifi
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          source $IDF_PATH/export.sh
+          python scripts/build.py alientek/atk-dnesp32s3-box2-wifi --name atk-dnesp32s3-box2-wifi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: box2-firmware
+          path: build/merged-binary.bin
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: box2-firmware
+
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || 'box2-latest' }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BIN="xiaozhi-box2-wifi-${SHORT_SHA}.bin"
+          mv merged-binary.bin "$BIN"
+
+          NOTES=$(printf 'BOX2 Wi-Fi 固件 %s\n分支: %s\n提交: %s\n\n刷机命令（全合并镜像，一条命令）:\nesptool --chip esp32s3 -b 460800 write_flash 0x0 %s\n\n功能说明见 main/boards/alientek/atk-dnesp32s3-box2-wifi/README.md' "$SHORT_SHA" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$BIN")
+
+          # 滚动标签：删除旧 Release 与标签后重建，下载链接保持不变
+          if [[ "$TAG" == "box2-latest" ]]; then
+            gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          fi
+
+          gh release create "$TAG" "$BIN" \
+            --title "BOX2 Wi-Fi 固件 ${SHORT_SHA}" \
+            --notes "$NOTES" \
+            --repo "$GITHUB_REPOSITORY"
