@@ -1761,8 +1761,12 @@ private:
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
-        AddUsageBarRow(card, "5h", acc.remaining_5h);
-        AddUsageBarRow(card, "周", acc.remaining_weekly);
+        if (acc.remaining_5h >= 0) {
+            AddUsageBarRow(card, "5h", acc.remaining_5h);
+        }
+        if (acc.remaining_weekly >= 0) {
+            AddUsageBarRow(card, "周", acc.remaining_weekly);
+        }
     }
 
     void ShowUsagePanelLoading() {
@@ -1987,9 +1991,13 @@ private:
             AddDetailInfoLine(content, "订阅有效至 " + acc.subscription_until, 0x9AA0A6);
         }
 
-        // 三个限额窗口
-        AddDetailBarBlock(content, "5小时窗口", acc.remaining_5h, acc.reset_5h);
-        AddDetailBarBlock(content, "每周窗口", acc.remaining_weekly, acc.reset_weekly);
+        // 限额窗口：接口未返回该项数据时整块隐藏
+        if (acc.remaining_5h >= 0) {
+            AddDetailBarBlock(content, "5小时窗口", acc.remaining_5h, acc.reset_5h);
+        }
+        if (acc.remaining_weekly >= 0) {
+            AddDetailBarBlock(content, "每周窗口", acc.remaining_weekly, acc.reset_weekly);
+        }
         if (acc.remaining_cr >= 0) {
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
         }
