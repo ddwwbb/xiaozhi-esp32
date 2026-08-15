@@ -6,6 +6,8 @@ on:
     branches:
       - main
       - feat/box2-wifi-return-key-usage
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
     inputs:
       tag:
