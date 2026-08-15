@@ -83,7 +83,13 @@ private:
         bool disabled = false;
         long success_total = -1;  // -1 = 无此数据（直连模式）
         long failed_total = -1;
-        std::vector<std::pair<int, int>> buckets;  // 20×10min 桶：成功/失败
+        std::vector<std::pair<int, int>> buckets;  // CPA: 20×10min 桶：成功/失败
+        // 官方 wham/profiles/me 与 rate-limit-reset-credits 数据（直连模式）
+        std::vector<std::pair<std::string, long long>> daily_buckets;  // 每日 token 用量
+        long long lifetime_tokens = -1;
+        long long peak_daily_tokens = -1;
+        long current_streak_days = -1;
+        int reset_credits = -1;  // 可用限额重置积分
         // api-call wham/usage 查询结果
         int remaining_5h = -1;
         int remaining_weekly = -1;
@@ -755,16 +761,27 @@ private:
             }
 
             std::string access_token = get_str("access_token");
+            std::string final_token;
             int status = -1;
             if (!access_token.empty() && !acc.account_id.empty()) {
                 status = DirectFetchUsage(access_token, acc.account_id, acc);
+                if (status == 200) {
+                    final_token = access_token;
+                }
             }
             if (status == 401) {
                 // access_token 过期：OAuth 刷新（新令牌已回写 NVS）后重试一次
                 std::string new_token = RefreshCodexToken(root, (int)i);
                 if (!new_token.empty()) {
                     status = DirectFetchUsage(new_token, acc.account_id, acc);
+                    if (status == 200) {
+                        final_token = new_token;
+                    }
                 }
+            }
+            if (status == 200 && !final_token.empty()) {
+                // 每日用量/统计/重置积分；失败不致命，字段保持 -1
+                FetchOfficialExtras(final_token, acc.account_id, acc);
             }
             if (status == 200) {
                 ok_count++;
@@ -1606,6 +1623,56 @@ private:
         return 200;
     }
 
+    // 直连官方扩展数据：每日 token 用量/统计（profiles/me）+ 可用重置积分
+    static void FetchOfficialExtras(const std::string& access_token, const std::string& account_id,
+                                    AccountDetail& acc) {
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Authorization", "Bearer " + access_token},
+            {"Content-Type", "application/json"},
+            {"User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"},
+            {"Chatgpt-Account-Id", account_id},
+        };
+
+        int status = 0;
+        std::string body;
+        if (HttpsRequest("chatgpt.com", "/backend-api/wham/profiles/me", "GET", headers, "", status, body) &&
+            status == 200) {
+            cJSON* root = cJSON_Parse(body.c_str());
+            cJSON* stats = root != nullptr ? cJSON_GetObjectItem(root, "stats") : nullptr;
+            if (stats != nullptr) {
+                auto number_value = [](cJSON* parent, const char* key) -> long long {
+                    cJSON* item = cJSON_GetObjectItem(parent, key);
+                    return cJSON_IsNumber(item) ? (long long)item->valuedouble : -1;
+                };
+                acc.lifetime_tokens = number_value(stats, "lifetime_tokens");
+                acc.peak_daily_tokens = number_value(stats, "peak_daily_tokens");
+                acc.current_streak_days = (long)number_value(stats, "current_streak_days");
+                cJSON* bucket = nullptr;
+                cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(stats, "daily_usage_buckets")) {
+                    cJSON* date_item = cJSON_GetObjectItem(bucket, "start_date");
+                    cJSON* tokens_item = cJSON_GetObjectItem(bucket, "tokens");
+                    if (cJSON_IsString(date_item) && cJSON_IsNumber(tokens_item)) {
+                        acc.daily_buckets.emplace_back(date_item->valuestring,
+                                                       (long long)tokens_item->valuedouble);
+                    }
+                }
+            }
+            cJSON_Delete(root);
+        }
+
+        status = 0;
+        if (HttpsRequest("chatgpt.com", "/backend-api/wham/rate-limit-reset-credits", "GET", headers, "",
+                         status, body) &&
+            status == 200) {
+            cJSON* root = cJSON_Parse(body.c_str());
+            cJSON* count = root != nullptr ? cJSON_GetObjectItem(root, "available_count") : nullptr;
+            if (cJSON_IsNumber(count)) {
+                acc.reset_credits = count->valueint;
+            }
+            cJSON_Delete(root);
+        }
+    }
+
     // OAuth 刷新令牌（端点与参数同 CPA），成功后把新令牌回写 NVS 并返回新 access_token
     static std::string RefreshCodexToken(cJSON* auth_json, int slot_index) {
         cJSON* refresh_item = cJSON_GetObjectItem(auth_json, "refresh_token");
@@ -1961,7 +2028,67 @@ private:
         lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
     }
 
-    // 近 200 分钟请求分布：20 桶迷你柱状图（下绿=成功，上红=失败）
+    static std::string FormatTokens(long long value) {
+        char label[24];
+        if (value < 0) {
+            return "-";
+        }
+        if (value >= 100000000LL) {
+            snprintf(label, sizeof(label), "%.2f亿", value / 100000000.0);
+        } else if (value >= 10000LL) {
+            snprintf(label, sizeof(label), "%.1f万", value / 10000.0);
+        } else {
+            snprintf(label, sizeof(label), "%lld", value);
+        }
+        return label;
+    }
+
+    // 每日 token 用量柱状图（官方 daily_usage_buckets，取末尾最多 14 天）
+    void AddDailyTokensChart(lv_obj_t* parent, const std::vector<std::pair<std::string, long long>>& buckets) {
+        auto display = GetDisplay();
+        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+
+        lv_obj_t* chart = lv_obj_create(parent);
+        lv_obj_set_width(chart, lv_pct(100));
+        lv_obj_set_height(chart, 40);
+        lv_obj_set_style_bg_color(chart, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(chart, 8, 0);
+        lv_obj_set_style_border_width(chart, 0, 0);
+        lv_obj_set_style_pad_hor(chart, 4, 0);
+        lv_obj_set_style_pad_ver(chart, 4, 0);
+        lv_obj_set_style_pad_column(chart, 2, 0);
+        lv_obj_set_flex_flow(chart, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(chart, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+        lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_text_font(chart, font, 0);
+
+        size_t count = buckets.size() > 14 ? 14 : buckets.size();
+        size_t offset = buckets.size() - count;
+        long long max_tokens = 1;
+        for (size_t i = offset; i < buckets.size(); i++) {
+            max_tokens = std::max(max_tokens, buckets[i].second);
+        }
+        for (size_t i = offset; i < buckets.size(); i++) {
+            long long tokens = buckets[i].second;
+            int height = tokens > 0 ? (int)(tokens * 32 / max_tokens) : 0;
+            if (height < 2) {
+                height = 2;
+            }
+            lv_color_t color = tokens * 100 > max_tokens * 80
+                                   ? lv_color_hex(0xFBBC04)  // 高峰日黄色提示
+                                   : lv_color_hex(0x8AB4F8);
+            lv_obj_t* bar = lv_obj_create(chart);
+            lv_obj_set_size(bar, 6, height);
+            lv_obj_set_style_bg_color(bar, color, 0);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(bar, 1, 0);
+            lv_obj_set_style_border_width(bar, 0, 0);
+            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        }
+    }
+
+    // 近 200 分钟请求分布：20 桶迷你柱状图（下绿=成功，上红=失败，CPA 模式）
     void AddUsageBucketsChart(lv_obj_t* parent, const std::vector<std::pair<int, int>>& buckets) {
         auto display = GetDisplay();
         auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
@@ -2098,7 +2225,7 @@ private:
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
         }
 
-        // 近 200 分钟请求分布 + 累计（CPA 模式数据；直连模式无此数据）
+        // CPA 模式：近 200 分钟请求分布 + 累计
         if (!acc.buckets.empty()) {
             AddDetailInfoLine(content, "近200分钟请求(绿成功/红失败)", 0x9AA0A6);
             AddUsageBucketsChart(content, acc.buckets);
@@ -2107,6 +2234,30 @@ private:
             AddDetailInfoLine(content,
                               "累计 成功" + std::to_string(acc.success_total) + " 失败" + std::to_string(acc.failed_total),
                               0x9AA0A6);
+        }
+
+        // 直连模式：官方数据（重置积分 / 每日 token / 统计）
+        if (acc.reset_credits > 0) {
+            AddDetailInfoLine(content, "限额重置积分:" + std::to_string(acc.reset_credits) + "个可用", 0x8AB4F8);
+        }
+        if (!acc.daily_buckets.empty()) {
+            size_t days = acc.daily_buckets.size() > 14 ? 14 : acc.daily_buckets.size();
+            AddDetailInfoLine(content, "近" + std::to_string(days) + "天token用量(高峰黄色)", 0x9AA0A6);
+            AddDailyTokensChart(content, acc.daily_buckets);
+        }
+        std::string stats_line;
+        if (acc.current_streak_days >= 0) {
+            stats_line += "连续" + std::to_string(acc.current_streak_days) + "天";
+        }
+        if (acc.peak_daily_tokens >= 0) {
+            stats_line += (stats_line.empty() ? std::string() : std::string(" · ")) + "日峰值" +
+                          FormatTokens(acc.peak_daily_tokens);
+        }
+        if (!stats_line.empty()) {
+            AddDetailInfoLine(content, stats_line, 0x9AA0A6);
+        }
+        if (acc.lifetime_tokens >= 0) {
+            AddDetailInfoLine(content, "累计token " + FormatTokens(acc.lifetime_tokens), 0x9AA0A6);
         }
 
         if (!acc.last_refresh.empty()) {
