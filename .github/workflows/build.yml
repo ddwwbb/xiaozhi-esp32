@@ -8,6 +8,12 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board to build (board path or name, empty = all)'
+        required: false
+        default: 'alientek/atk-dnesp32s3-box2-wifi'
 
 permissions:
   contents: read
@@ -34,6 +40,29 @@ jobs:
         shell: bash
         run: |
           EVENT_NAME="${{ github.event_name }}"
+
+          # 手动触发：按输入的板型过滤，留空编译全部
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            BOARD_INPUT="${{ github.event.inputs.board }}"
+            {
+              printf 'variants='
+              if [[ -z "$BOARD_INPUT" ]]; then
+                python scripts/build.py --list-boards --json
+              else
+                python scripts/build.py --list-boards --json | python -c "
+          import json, sys
+          wanted = '''$BOARD_INPUT'''.strip()
+          boards = json.load(sys.stdin)
+          picked = [b for b in boards if wanted in (b.get('board', ''), b.get('name', ''), b.get('full_name', ''))]
+          if not picked:
+              sys.stderr.write('no board matched: %s\n' % wanted)
+              sys.exit(1)
+          print(json.dumps(picked))
+          "
+              fi
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # push 到 main 分支，编译全部变体
           if [[ "$EVENT_NAME" == "push" ]]; then
