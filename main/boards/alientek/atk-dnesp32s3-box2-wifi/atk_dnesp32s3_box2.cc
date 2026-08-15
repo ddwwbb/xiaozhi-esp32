@@ -11,7 +11,6 @@
 #include "power_manager.h"
 
 #include "i2c_device.h"
-#include "sdkconfig.h"
 #include "settings.h"
 #include "lvgl_theme.h"
 #include <lvgl.h>
@@ -94,7 +93,6 @@ private:
         int reset_weekly = -1;
         int reset_cr = -1;
         // 查询时需要
-        std::string auth_index;
         std::string account_id;
     };
 
@@ -109,7 +107,7 @@ private:
     int pending_detail_restore_ = -1;
 
 
-    // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 CPA 格式的 codex auth json
+    // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 codex auth.json 格式
     static std::string CodexAuthKey(int index) {
         return "codex_auth_" + std::to_string(index + 1);
     }
@@ -312,11 +310,11 @@ private:
             "<title>用量查询配置</title></head>"
             "<body style=\"font-family:sans-serif;max-width:520px;margin:24px auto\">"
             "<h2>ChatGPT 用量查询配置（官方接口直连）</h2>"
-            "<h3>直连账号（优先，无需 CPA）</h3>";
+            "<h3>直连账号</h3>";
 
         auto jsons = instance_->LoadDirectAuthJsons();
         if (jsons.empty()) {
-            page += "<p><small>尚未导入账号令牌。把 CPA 的 auths/*.json 内容粘贴到下面导入，"
+            page += "<p><small>尚未导入账号令牌。把 Codex 令牌文件（auth.json）内容粘贴到下面导入，"
                     "设备将直连官方接口查询用量并自动刷新令牌。</small></p>";
         } else {
             for (size_t i = 0; i < jsons.size(); i++) {
@@ -338,7 +336,7 @@ private:
 
         page += "<form method=\"POST\" action=\"/import\">"
                 "<textarea name=\"auth_json\" rows=\"5\" style=\"width:100%\" "
-                "placeholder=\"粘贴 CPA 令牌文件内容（auths/*.json，需含 refresh_token）\"></textarea>"
+                "placeholder=\"粘贴 Codex 令牌文件内容（auth.json，需含 refresh_token）\"></textarea>"
                 "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 8 个</small></p>"
                 "</form>"
 
@@ -676,7 +674,7 @@ private:
         }
     }
 
-    // 直连官方接口模式：使用配置页导入的 CPA 格式令牌；401 时自动刷新并重试
+    // 直连官方接口模式：使用导入的 codex 令牌；401 时自动刷新并重试
     void QueryDirectUsage() {
         std::vector<std::string> jsons = LoadDirectAuthJsons();
         std::vector<AccountDetail> details;
@@ -1247,7 +1245,7 @@ private:
         return cJSON_IsString(item) ? item->valuestring : "";
     }
 
-    // 用 id_token 填充账号展示信息（套餐/订阅/账号ID），字段名与 CPA jwt_parser 一致
+    // 用 id_token 填充账号展示信息（套餐/订阅/账号ID），字段名与 codex 官方 JWT 声明一致
     void FillDetailFromIdToken(AccountDetail& acc, const std::string& id_token) {
         cJSON* payload = DecodeJwtPayload(id_token);
         if (payload == nullptr) {
@@ -1369,7 +1367,7 @@ private:
         }
     }
 
-    // OAuth 刷新令牌（端点与参数同 CPA），成功后把新令牌回写 NVS 并返回新 access_token
+    // OAuth 刷新令牌（codex 官方端点与参数），成功后把新令牌回写 NVS 并返回新 access_token
     static std::string RefreshCodexToken(cJSON* auth_json, int slot_index) {
         cJSON* refresh_item = cJSON_GetObjectItem(auth_json, "refresh_token");
         if (!cJSON_IsString(refresh_item) || refresh_item->valuestring[0] == '\0') {
