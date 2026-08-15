@@ -79,12 +79,8 @@ private:
         std::string name;                // 邮箱前缀，无邮箱时为 账号N
         std::string subscription_until;  // 订阅有效期（显示子串）
         std::string last_refresh;        // Token 最近刷新（显示子串）
-        bool unavailable = false;
-        bool disabled = false;
-        long success_total = -1;  // -1 = 无此数据（直连模式）
-        long failed_total = -1;
-        std::vector<std::pair<int, int>> buckets;  // CPA: 20×10min 桶：成功/失败
-        // 官方 wham/profiles/me 与 rate-limit-reset-credits 数据（直连模式）
+        bool unavailable = false;  // 401/403 等令牌异常标记
+        // 官方 wham/profiles/me 与 rate-limit-reset-credits 数据
         std::vector<std::pair<std::string, long long>> daily_buckets;  // 每日 token 用量
         long long lifetime_tokens = -1;
         long long peak_daily_tokens = -1;
@@ -107,27 +103,11 @@ private:
     esp_timer_handle_t usage_panel_timer_ = nullptr;
     // 面板数据缓存：列表页与详情页共用；-1 表示当前是列表页
     std::vector<AccountDetail> usage_details_;
-    int usage_cooling_ = 0;
     int usage_detail_index_ = -1;
     // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
     esp_timer_handle_t usage_refresh_timer_ = nullptr;
     int pending_detail_restore_ = -1;
 
-    // 用量查询配置：NVS（vendor 命名空间）优先，Kconfig 为出厂默认
-    struct CliproxyConfig {
-        std::string base_url;
-        std::string management_key;
-        std::string provider;
-    };
-
-    CliproxyConfig GetCliproxyConfig() {
-        CliproxyConfig cfg;
-        Settings settings("vendor");
-        cfg.base_url = settings.GetString("cliproxy_base_url", CONFIG_CLIPROXY_USAGE_BASE_URL);
-        cfg.management_key = settings.GetString("cliproxy_management_key", CONFIG_CLIPROXY_USAGE_MANAGEMENT_KEY);
-        cfg.provider = settings.GetString("cliproxy_provider", CONFIG_CLIPROXY_USAGE_PROVIDER);
-        return cfg;
-    }
 
     // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 CPA 格式的 codex auth json
     static std::string CodexAuthKey(int index) {
@@ -323,7 +303,6 @@ private:
     }
 
     static std::string GetConfigPage() {
-        auto cfg = instance_->GetCliproxyConfig();
         auto cfg_proxy = instance_->GetSocks5Config();
         int refresh_minutes = instance_->GetUsageRefreshMinutes();
 
@@ -332,7 +311,7 @@ private:
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>用量查询配置</title></head>"
             "<body style=\"font-family:sans-serif;max-width:520px;margin:24px auto\">"
-            "<h2>ChatGPT 用量查询配置</h2>"
+            "<h2>ChatGPT 用量查询配置（官方接口直连）</h2>"
             "<h3>直连账号（优先，无需 CPA）</h3>";
 
         auto jsons = instance_->LoadDirectAuthJsons();
@@ -363,16 +342,9 @@ private:
                 "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 8 个</small></p>"
                 "</form>"
 
-                "<h3>CPA 中转（无直连账号时的回退）</h3>"
                 "<form method=\"POST\" action=\"/save\">"
-                "<p>CLIProxyAPI 地址<br><input name=\"base_url\" value=\"" + cfg.base_url +
-                "\" style=\"width:100%\" placeholder=\"http://192.168.1.10:8317\"></p>"
-                "<p>Management Key<br><input name=\"management_key\" style=\"width:100%\" "
-                "placeholder=\"留空表示不修改\"></p>"
-                "<p>Provider 过滤<br><input name=\"provider\" value=\"" + cfg.provider +
-                "\" style=\"width:100%\" placeholder=\"codex\"></p>"
 
-                "<h3>网络代理（直连模式可选）</h3>"
+                "<h3>网络代理（可选，访问官方接口需要）</h3>"
                 "<p>类型 "
                 "<select name=\"proxy_type\">"
                 "<option value=\"socks5\"" + std::string(cfg_proxy.type == "socks5" ? " selected" : "") + ">SOCKS5</option>"
@@ -550,9 +522,6 @@ private:
             return ESP_FAIL;
         }
 
-        auto base_url = GetFormField(body, "base_url");
-        auto management_key = GetFormField(body, "management_key");
-        auto provider = GetFormField(body, "provider");
         auto refresh_minutes = GetFormField(body, "refresh_minutes");
         auto proxy_type = GetFormField(body, "proxy_type");
         auto proxy_host = GetFormField(body, "proxy_host");
@@ -561,15 +530,6 @@ private:
         auto proxy_pass = GetFormField(body, "proxy_pass");
 
         Settings settings("vendor", true);
-        if (!base_url.empty()) {
-            settings.SetString("cliproxy_base_url", base_url);
-        }
-        if (!management_key.empty()) {
-            settings.SetString("cliproxy_management_key", management_key);
-        }
-        if (!provider.empty()) {
-            settings.SetString("cliproxy_provider", provider);
-        }
         if (!proxy_type.empty()) {
             settings.SetString("usage_proxy_type", proxy_type == "http" ? "http" : "socks5");
         }
@@ -594,8 +554,6 @@ private:
             if (minutes > 1440) minutes = 1440;
             settings.SetInt("usage_refresh_minutes", minutes);
         }
-        settings.SetString("cliproxy_configured", "1");
-
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
                              "<body><h3>已保存，设备正在退出配置模式</h3></body></html>",
@@ -703,8 +661,9 @@ private:
         ESP_LOGI(TAG, "Usage config mode: http://%s/", ip.c_str());
     }
 
-    // 查询 CLIProxyAPI (GET /v0/management/auth-files) 的账号套餐用量并在屏幕显示
-    void StartChatGptUsageQuery() {        if (usage_fetching_.exchange(true)) {
+    // 用导入的账号令牌直连官方接口查询用量并展示
+    void StartChatGptUsageQuery() {
+        if (usage_fetching_.exchange(true)) {
             return;
         }
         if (xTaskCreate([](void* arg) {
@@ -715,16 +674,6 @@ private:
             }, "usage_query", 10240, this, 4, nullptr) != pdPASS) {
             usage_fetching_ = false;
         }
-    }
-
-    static int GetJsonInt(cJSON* obj, const char* key) {
-        cJSON* item = cJSON_GetObjectItem(obj, key);
-        return cJSON_IsNumber(item) ? item->valueint : 0;
-    }
-
-    static bool GetJsonBool(cJSON* obj, const char* key) {
-        cJSON* item = cJSON_GetObjectItem(obj, key);
-        return cJSON_IsTrue(item);
     }
 
     // 直连官方接口模式：使用配置页导入的 CPA 格式令牌；401 时自动刷新并重试
@@ -797,197 +746,17 @@ private:
             GetDisplay()->ShowNotification("直连查询失败:令牌失效或无法访问chatgpt.com", 4000);
             return;
         }
-        ShowUsageListPanel(std::move(details), 0);
+        ShowUsageListPanel(std::move(details));
     }
 
     void QueryChatGptUsage() {
-        auto display = GetDisplay();
         pending_detail_restore_ = usage_detail_index_;
-
-        // 直连模式优先：导入了账号令牌就不依赖 CPA
-        if (!LoadDirectAuthJsons().empty()) {
-            ShowUsagePanelLoading();
-            QueryDirectUsage();
+        if (LoadDirectAuthJsons().empty()) {
+            GetDisplay()->ShowNotification("未导入账号令牌,长按Q键配置", 3000);
             return;
         }
-
-        CliproxyConfig cfg = GetCliproxyConfig();
-        const std::string& base_url = cfg.base_url;
-        const std::string& management_key = cfg.management_key;
-        if (base_url.empty() || management_key.empty()) {
-            display->ShowNotification("未配置,长按Q键进入配置", 3000);
-            return;
-        }
-
         ShowUsagePanelLoading();
-
-        std::string url = base_url + "/v0/management/auth-files";
-        auto http = GetNetwork()->CreateHttp(0);
-        http->SetTimeout(10000);
-        http->SetHeader("Authorization", "Bearer " + management_key);
-        http->SetHeader("Accept", "application/json");
-        if (!http->Open("GET", url)) {
-            ESP_LOGE(TAG, "Usage query: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
-            HideUsagePanel();
-            display->ShowNotification("用量查询失败:无法连接", 3000);
-            return;
-        }
-        int status = http->GetStatusCode();
-        std::string body = status == 200 ? http->ReadAll() : "";
-        http->Close();
-
-        if (status != 200) {
-            ESP_LOGE(TAG, "Usage query: HTTP %d", status);
-            std::string reason = "查询失败:HTTP " + std::to_string(status);
-            if (status == 401) {
-                reason = "查询失败:密钥错误(401)";
-            } else if (status == 404) {
-                reason = "查询失败:管理接口未启用(404)";
-            }
-            HideUsagePanel();
-            display->ShowNotification(reason, 3000);
-            return;
-        }
-
-        cJSON* root = cJSON_Parse(body.c_str());
-        if (root == nullptr) {
-            HideUsagePanel();
-            display->ShowNotification("用量查询失败:响应解析错误", 3000);
-            return;
-        }
-
-        const char* provider_filter = cfg.provider.c_str();
-        int accounts = 0;
-        int window_success = 0;
-        int window_failed = 0;
-        int cooling = 0;
-        std::vector<std::string> plans;
-        std::vector<AccountDetail> details;
-
-        cJSON* files = cJSON_GetObjectItem(root, "files");
-        cJSON* file = nullptr;
-        cJSON_ArrayForEach(file, files) {
-            if (!cJSON_IsObject(file)) {
-                continue;
-            }
-            cJSON* provider_item = cJSON_GetObjectItem(file, "provider");
-            const char* provider = cJSON_IsString(provider_item) ? provider_item->valuestring : "";
-            if (provider_filter[0] != '\0' && strcasecmp(provider, provider_filter) != 0) {
-                continue;
-            }
-            accounts++;
-
-            cJSON* id_token = cJSON_GetObjectItem(file, "id_token");
-            cJSON* plan_item = id_token ? cJSON_GetObjectItem(id_token, "plan_type") : nullptr;
-            const char* plan = cJSON_IsString(plan_item) ? plan_item->valuestring : nullptr;
-
-            bool codex = strcasecmp(provider, "codex") == 0;
-            AccountDetail acc;
-            if (codex) {
-                cJSON* index_item = cJSON_GetObjectItem(file, "auth_index");
-                acc.auth_index = cJSON_IsString(index_item) ? index_item->valuestring : "";
-                cJSON* account_item = id_token ? cJSON_GetObjectItem(id_token, "chatgpt_account_id") : nullptr;
-                acc.account_id = cJSON_IsString(account_item) ? account_item->valuestring : "";
-            }
-
-            cJSON* email_item = cJSON_GetObjectItem(file, "email");
-            if (cJSON_IsString(email_item)) {
-                acc.email = email_item->valuestring;
-            }
-            if (plan != nullptr) {
-                acc.plan = plan;
-            }
-            acc.unavailable = GetJsonBool(file, "unavailable");
-            acc.disabled = GetJsonBool(file, "disabled");
-            if (acc.unavailable || acc.disabled) {
-                cooling++;
-            }
-            acc.success_total = GetJsonInt(file, "success");
-            acc.failed_total = GetJsonInt(file, "failed");
-
-            cJSON* bucket = nullptr;
-            cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(file, "recent_requests")) {
-                int s = GetJsonInt(bucket, "success");
-                int f = GetJsonInt(bucket, "failed");
-                window_success += s;
-                window_failed += f;
-                if (codex) {
-                    acc.buckets.emplace_back(s, f);
-                }
-            }
-
-            auto copy_display_substring = [](cJSON* parent, const char* key, size_t from, size_t len) {
-                cJSON* item = parent ? cJSON_GetObjectItem(parent, key) : nullptr;
-                if (!cJSON_IsString(item)) {
-                    return std::string();
-                }
-                std::string raw = item->valuestring;
-                return raw.substr(from, std::min(len, raw.size()));
-            };
-            acc.subscription_until = copy_display_substring(id_token, "chatgpt_subscription_active_until", 0, 10);
-            acc.last_refresh = copy_display_substring(file, "last_refresh", 5, 11);
-
-            size_t at = acc.email.find('@');
-            acc.name = at != std::string::npos ? acc.email.substr(0, at) : acc.email;
-            if (acc.name.size() > 16) {
-                acc.name.resize(16);
-            }
-
-            if (plan != nullptr && plan[0] != '\0') {
-                bool exists = false;
-                for (auto& p : plans) {
-                    if (strcasecmp(p.c_str(), plan) == 0) {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (!exists) {
-                    plans.push_back(plan);
-                }
-            }
-
-            ESP_LOGI(TAG, "Usage: provider=%s email=%s plan=%s unavailable=%d",
-                     provider,
-                     acc.email.empty() ? "-" : acc.email.c_str(),
-                     plan ? plan : "-",
-                     acc.unavailable ? 1 : 0);
-
-            if (codex && !acc.auth_index.empty() && !acc.account_id.empty()) {
-                details.push_back(std::move(acc));
-            }
-        }
-        cJSON_Delete(root);
-
-        std::string label = "账号";
-        if (provider_filter[0] != '\0') {
-            label = strcasecmp(provider_filter, "codex") == 0 ? "ChatGPT" : provider_filter;
-        }
-        if (accounts == 0) {
-            HideUsagePanel();
-            display->ShowNotification("无" + label + "账号凭证", 3000);
-            return;
-        }
-
-        if (strcasecmp(provider_filter, "codex") == 0 && !details.empty()) {
-            ShowCodexRemaining(base_url, management_key, details, plans, cooling);
-            return;
-        }
-
-        std::string text = label + "账号:" + std::to_string(accounts) + "个";
-        if (!plans.empty()) {
-            text += "(";
-            for (size_t i = 0; i < plans.size(); i++) {
-                if (i > 0) text += ",";
-                text += plans[i];
-            }
-            text += ")";
-        }
-        text += "\n近200分钟 成功" + std::to_string(window_success) + " 失败" + std::to_string(window_failed);
-        if (cooling > 0) {
-            text += "\n限额冷却:" + std::to_string(cooling) + "个";
-        }
-        HideUsagePanel();
-        display->ShowNotification(text, 8000);
+        QueryDirectUsage();
     }
 
     // 窗口剩余百分比：优先 used_percent，退回 remaining_count/total_count；未知返回 -1
@@ -1021,79 +790,6 @@ private:
             return at->valueint - (int)time(nullptr);
         }
         return -1;
-    }
-
-    // 通过 POST /v0/management/api-call 用账号令牌代呼
-    // https://chatgpt.com/backend-api/wham/usage，填充 5h/每周/代码审查窗口
-    static bool FetchCodexRemaining(const std::string& base_url, const std::string& management_key,
-                                    AccountDetail& acc) {
-        cJSON* header = cJSON_CreateObject();
-        cJSON_AddStringToObject(header, "Authorization", "Bearer $TOKEN$");
-        cJSON_AddStringToObject(header, "Content-Type", "application/json");
-        cJSON_AddStringToObject(header, "User-Agent", "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal");
-        cJSON_AddStringToObject(header, "Chatgpt-Account-Id", acc.account_id.c_str());
-        cJSON* request = cJSON_CreateObject();
-        cJSON_AddStringToObject(request, "auth_index", acc.auth_index.c_str());
-        cJSON_AddStringToObject(request, "method", "GET");
-        cJSON_AddStringToObject(request, "url", "https://chatgpt.com/backend-api/wham/usage");
-        cJSON_AddItemToObject(request, "header", header);
-        char* printed = cJSON_PrintUnformatted(request);
-        std::string payload = printed != nullptr ? printed : "";
-        cJSON_free(printed);
-        cJSON_Delete(request);
-        if (payload.empty()) {
-            return false;
-        }
-
-        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
-        http->SetTimeout(8000);
-        http->SetHeader("Authorization", "Bearer " + management_key);
-        http->SetHeader("Content-Type", "application/json");
-        http->SetContent(std::move(payload));
-        std::string url = base_url + "/v0/management/api-call";
-        if (!http->Open("POST", url)) {
-            ESP_LOGE(TAG, "api-call: failed to open %s, err=0x%x", url.c_str(), http->GetLastError());
-            return false;
-        }
-        int status = http->GetStatusCode();
-        std::string body = status == 200 ? http->ReadAll() : "";
-        http->Close();
-        if (status != 200) {
-            ESP_LOGE(TAG, "api-call: HTTP %d (auth_index=%s)", status, acc.auth_index.c_str());
-            return false;
-        }
-
-        cJSON* root = cJSON_Parse(body.c_str());
-        if (root == nullptr) {
-            return false;
-        }
-        cJSON* upstream_status = cJSON_GetObjectItem(root, "status_code");
-        cJSON* usage_body = cJSON_GetObjectItem(root, "body");
-        cJSON* usage = (cJSON_IsNumber(upstream_status) && upstream_status->valueint == 200 &&
-                        cJSON_IsString(usage_body))
-                           ? cJSON_Parse(usage_body->valuestring)
-                           : nullptr;
-        cJSON_Delete(root);
-        if (usage == nullptr) {
-            return false;
-        }
-
-        cJSON* rate_limit = cJSON_GetObjectItem(usage, "rate_limit");
-        cJSON* primary = rate_limit ? cJSON_GetObjectItem(rate_limit, "primary_window") : nullptr;
-        cJSON* secondary = rate_limit ? cJSON_GetObjectItem(rate_limit, "secondary_window") : nullptr;
-        cJSON* cr_limit = cJSON_GetObjectItem(usage, "code_review_rate_limit");
-        cJSON* cr_primary = cr_limit ? cJSON_GetObjectItem(cr_limit, "primary_window") : nullptr;
-        acc.remaining_5h = WindowRemainingPct(primary);
-        acc.remaining_weekly = WindowRemainingPct(secondary);
-        acc.remaining_cr = WindowRemainingPct(cr_primary);
-        acc.reset_5h = WindowResetSeconds(primary);
-        acc.reset_weekly = WindowResetSeconds(secondary);
-        acc.reset_cr = WindowResetSeconds(cr_primary);
-        ESP_LOGI(TAG, "Codex usage: %s 5h=%d%%(%ds) weekly=%d%%(%ds) cr=%d%%(%ds)",
-                 acc.name.c_str(), acc.remaining_5h, acc.reset_5h, acc.remaining_weekly, acc.reset_weekly,
-                 acc.remaining_cr, acc.reset_cr);
-        cJSON_Delete(usage);
-        return acc.remaining_5h >= 0 || acc.remaining_weekly >= 0;
     }
 
     // ---------------- 直连 HTTPS 客户端：可选 SOCKS5 代理（RFC1928/1929）+ mbedtls TLS ----------------
@@ -2088,71 +1784,6 @@ private:
         }
     }
 
-    // 近 200 分钟请求分布：20 桶迷你柱状图（下绿=成功，上红=失败，CPA 模式）
-    void AddUsageBucketsChart(lv_obj_t* parent, const std::vector<std::pair<int, int>>& buckets) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
-
-        lv_obj_t* chart = lv_obj_create(parent);
-        lv_obj_set_width(chart, lv_pct(100));
-        lv_obj_set_height(chart, 36);
-        lv_obj_set_style_bg_color(chart, lv_color_hex(0x1A2028), 0);
-        lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(chart, 8, 0);
-        lv_obj_set_style_border_width(chart, 0, 0);
-        lv_obj_set_style_pad_hor(chart, 4, 0);
-        lv_obj_set_style_pad_ver(chart, 3, 0);
-        lv_obj_set_style_pad_column(chart, 2, 0);
-        lv_obj_set_flex_flow(chart, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(chart, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-        lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-
-        int max_value = 1;
-        for (auto& bucket : buckets) {
-            max_value = std::max(max_value, bucket.first + bucket.second);
-        }
-        for (auto& bucket : buckets) {
-            lv_obj_t* column = lv_obj_create(chart);
-            lv_obj_set_width(column, 6);
-            lv_obj_set_height(column, 30);
-            lv_obj_set_style_bg_opa(column, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(column, 0, 0);
-            lv_obj_set_style_pad_all(column, 0, 0);
-            lv_obj_set_style_pad_row(column, 0, 0);
-            lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_flex_align(column, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
-            lv_obj_clear_flag(column, LV_OBJ_FLAG_SCROLLABLE);
-
-            int failed_h = bucket.second * 30 / max_value;
-            int success_h = bucket.first * 30 / max_value;
-            if (failed_h > 0) {
-                lv_obj_t* failed_bar = lv_obj_create(column);
-                lv_obj_set_size(failed_bar, 6, failed_h);
-                lv_obj_set_style_bg_color(failed_bar, lv_color_hex(0xEA4335), 0);
-                lv_obj_set_style_bg_opa(failed_bar, LV_OPA_COVER, 0);
-                lv_obj_set_style_radius(failed_bar, 1, 0);
-                lv_obj_set_style_border_width(failed_bar, 0, 0);
-            }
-            if (success_h > 0) {
-                lv_obj_t* success_bar = lv_obj_create(column);
-                lv_obj_set_size(success_bar, 6, success_h);
-                lv_obj_set_style_bg_color(success_bar, lv_color_hex(0x34A853), 0);
-                lv_obj_set_style_bg_opa(success_bar, LV_OPA_COVER, 0);
-                lv_obj_set_style_radius(success_bar, 1, 0);
-                lv_obj_set_style_border_width(success_bar, 0, 0);
-            }
-            if (failed_h == 0 && success_h == 0) {
-                lv_obj_t* empty_bar = lv_obj_create(column);
-                lv_obj_set_size(empty_bar, 6, 2);
-                lv_obj_set_style_bg_color(empty_bar, lv_color_hex(0x2A2F36), 0);
-                lv_obj_set_style_bg_opa(empty_bar, LV_OPA_COVER, 0);
-                lv_obj_set_style_radius(empty_bar, 1, 0);
-                lv_obj_set_style_border_width(empty_bar, 0, 0);
-            }
-        }
-        (void)font;
-    }
-
     void AddDetailInfoLine(lv_obj_t* parent, const std::string& text, uint32_t color) {
         auto display = GetDisplay();
         auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
@@ -2225,18 +1856,7 @@ private:
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
         }
 
-        // CPA 模式：近 200 分钟请求分布 + 累计
-        if (!acc.buckets.empty()) {
-            AddDetailInfoLine(content, "近200分钟请求(绿成功/红失败)", 0x9AA0A6);
-            AddUsageBucketsChart(content, acc.buckets);
-        }
-        if (acc.success_total >= 0) {
-            AddDetailInfoLine(content,
-                              "累计 成功" + std::to_string(acc.success_total) + " 失败" + std::to_string(acc.failed_total),
-                              0x9AA0A6);
-        }
-
-        // 直连模式：官方数据（重置积分 / 每日 token / 统计）
+        // 官方数据（重置积分 / 每日 token / 统计）
         if (acc.reset_credits > 0) {
             AddDetailInfoLine(content, "限额重置积分:" + std::to_string(acc.reset_credits) + "个可用", 0x8AB4F8);
         }
@@ -2263,10 +1883,8 @@ private:
         if (!acc.last_refresh.empty()) {
             AddDetailInfoLine(content, "Token刷新 " + acc.last_refresh, 0x9AA0A6);
         }
-        if (acc.disabled) {
-            AddDetailInfoLine(content, "状态: 已禁用", 0xEA4335);
-        } else if (acc.unavailable) {
-            AddDetailInfoLine(content, "状态: 限额冷却/令牌异常", 0xFBBC04);
+        if (acc.unavailable) {
+            AddDetailInfoLine(content, "状态: 令牌异常,建议重新导入", 0xEA4335);
         }
 
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(30000000LL));
@@ -2301,36 +1919,13 @@ private:
         for (auto& acc : usage_details_) {
             AddUsageCard(content, acc);
         }
-        if (usage_cooling_ > 0) {
-            AddDetailInfoLine(content, "限额冷却:" + std::to_string(usage_cooling_) + "个账号", 0xFBBC04);
-        }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
     }
 
-    void ShowCodexRemaining(const std::string& base_url, const std::string& management_key,
-                            std::vector<AccountDetail>& details, std::vector<std::string>& plans, int cooling) {
-        // 逐账号出站查询较慢，最多查 4 个账号
-        const size_t kMaxQueried = 4;
-        int failed = 0;
 
-        for (size_t i = 0; i < details.size() && i < kMaxQueried; i++) {
-            if (!FetchCodexRemaining(base_url, management_key, details[i])) {
-                failed++;
-            }
-        }
-
-        if (details.empty() || failed == (int)std::min(details.size(), kMaxQueried)) {
-            HideUsagePanel();
-            GetDisplay()->ShowNotification("剩余用量查询失败:api-call不可用", 3000);
-            return;
-        }
-
-        ShowUsageListPanel(std::move(details), cooling);
-    }
-
-    // CPA 与直连两种模式的共用列表页；自动刷新后恢复原详情页
-    void ShowUsageListPanel(std::vector<AccountDetail> details, int cooling) {
+    // 列表页；自动刷新后恢复原详情页
+    void ShowUsageListPanel(std::vector<AccountDetail> details) {
         std::vector<std::string> plans;
         int min_remaining = 101;
         int min_reset = -1;
@@ -2367,7 +1962,6 @@ private:
         }
 
         usage_details_ = std::move(details);
-        usage_cooling_ = cooling;
         usage_detail_index_ = -1;
 
         int restore = pending_detail_restore_;
@@ -2386,9 +1980,6 @@ private:
         DisplayLockGuard lock(GetDisplay());
         for (auto& acc : usage_details_) {
             AddUsageCard(content, acc);
-        }
-        if (cooling > 0) {
-            AddDetailInfoLine(content, "限额冷却:" + std::to_string(cooling) + "个账号", 0xFBBC04);
         }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
