@@ -104,7 +104,12 @@ private:
     int usage_detail_index_ = -1;
     // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
     esp_timer_handle_t usage_refresh_timer_ = nullptr;
+    esp_timer_handle_t usage_watch_timer_ = nullptr;
+    esp_timer_handle_t usage_loading_timer_ = nullptr;
+    lv_obj_t* loading_label_ = nullptr;
+    int loading_dots_ = 0;
     int pending_detail_restore_ = -1;
+    time_t usage_updated_at_ = 0;
 
 
     // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 codex auth.json 格式
@@ -753,7 +758,12 @@ private:
             GetDisplay()->ShowNotification("未导入账号令牌,长按Q键配置", 3000);
             return;
         }
-        ShowUsagePanelLoading();
+        // 自动刷新时面板已在显示，跳过 loading 重建避免闪烁，数据到达后直接替换
+        if (usage_panel_ == nullptr) {
+            ShowUsagePanelLoading();
+        } else {
+            power_save_timer_->WakeUp();
+        }
         QueryDirectUsage();
     }
 
@@ -1435,6 +1445,37 @@ private:
         return access_item->valuestring;
     }
 
+    static void PlanBadgeColors(const std::string& plan, uint32_t& text, uint32_t& bg) {
+        if (strcasecmp(plan.c_str(), "pro") == 0) {
+            text = 0xD7A9FF;
+            bg = 0x3A2A4D;
+        } else if (strcasecmp(plan.c_str(), "team") == 0 || strcasecmp(plan.c_str(), "business") == 0) {
+            text = 0xFDD663;
+            bg = 0x443B1E;
+        } else if (strcasecmp(plan.c_str(), "free") == 0) {
+            text = 0x9AA0A6;
+            bg = 0x26292E;
+        } else {  // plus 及未知
+            text = 0x8AB4F8;
+            bg = 0x283142;
+        }
+    }
+
+    static std::string FormatResetShort(int seconds) {
+        if (seconds <= 0) {
+            return "";
+        }
+        char label[20];
+        if (seconds >= 86400) {
+            snprintf(label, sizeof(label), "%d日%d时", seconds / 86400, (seconds % 86400) / 3600);
+        } else if (seconds >= 3600) {
+            snprintf(label, sizeof(label), "%.1f时", seconds / 3600.0);
+        } else {
+            snprintf(label, sizeof(label), "%d分", seconds / 60);
+        }
+        return label;
+    }
+
     static lv_color_t UsageBarColor(int remaining_pct) {
         if (remaining_pct < 0) {
             return lv_color_hex(0x5F6368);
@@ -1455,6 +1496,14 @@ private:
         if (usage_refresh_timer_ != nullptr) {
             esp_timer_stop(usage_refresh_timer_);
         }
+        if (usage_watch_timer_ != nullptr) {
+            esp_timer_stop(usage_watch_timer_);
+            power_save_timer_->SetEnabled(true);
+        }
+        if (usage_loading_timer_ != nullptr) {
+            esp_timer_stop(usage_loading_timer_);
+        }
+        loading_label_ = nullptr;
         usage_detail_index_ = -1;
         if (usage_panel_ == nullptr) {
             return;
@@ -1509,7 +1558,42 @@ private:
     }
 
     // 创建面板骨架（深色全屏 + 标题），返回内容容器；UI 未就绪时返回 nullptr
-    lv_obj_t* CreateUsagePanelBase(const char* title, const char* subtitle) {
+    // 标题行右侧的数据时间戳
+    std::string FormatUpdatedAt(time_t at) {
+        if (at <= 0) {
+            return "";
+        }
+        char label[16];
+        strftime(label, sizeof(label), "更新%H:%M", localtime(&at));
+        return label;
+    }
+
+    // 面板显示期间：对话开始自动收起 + 屏幕保持亮
+    void StartUsagePanelWatchdog() {
+        if (usage_watch_timer_ == nullptr) {
+            esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    auto state = Application::GetInstance().GetDeviceState();
+                    if (state != kDeviceStateIdle && state != kDeviceStateStarting) {
+                        instance_->HideUsagePanel();
+                        return;
+                    }
+                    instance_->power_save_timer_->WakeUp();
+                },
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "usage_watch",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &usage_watch_timer_));
+        }
+        esp_timer_stop(usage_watch_timer_);
+        esp_timer_start_periodic(usage_watch_timer_, 2000000);  // 2 秒
+        power_save_timer_->SetEnabled(false);
+        power_save_timer_->WakeUp();
+    }
+
+    lv_obj_t* CreateUsagePanelBase(const char* title, const char* nav_hint) {
         HideUsagePanel();
         auto display = GetDisplay();
         if (display->GetTheme() == nullptr) {
@@ -1532,14 +1616,32 @@ private:
         lv_obj_clear_flag(usage_panel_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_text_font(usage_panel_, font, 0);
 
-        lv_obj_t* header = lv_label_create(usage_panel_);
+        // 标题行：左标题，右数据时间戳
+        lv_obj_t* header_row = lv_obj_create(usage_panel_);
+        lv_obj_set_width(header_row, lv_pct(100));
+        lv_obj_set_height(header_row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(header_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(header_row, 0, 0);
+        lv_obj_set_style_pad_all(header_row, 0, 0);
+        lv_obj_set_flex_flow(header_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(header_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(header_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* header = lv_label_create(header_row);
         lv_obj_set_style_text_color(header, lv_color_hex(0xE8EAED), 0);
         lv_label_set_text(header, title);
 
-        if (subtitle != nullptr && subtitle[0] != '\0') {
-            lv_obj_t* sub = lv_label_create(usage_panel_);
-            lv_obj_set_style_text_color(sub, lv_color_hex(0x9AA0A6), 0);
-            lv_label_set_text(sub, subtitle);
+        std::string updated = FormatUpdatedAt(usage_updated_at_);
+        if (!updated.empty()) {
+            lv_obj_t* updated_label = lv_label_create(header_row);
+            lv_obj_set_style_text_color(updated_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(updated_label, updated.c_str());
+        }
+
+        if (nav_hint != nullptr && nav_hint[0] != '\0') {
+            lv_obj_t* nav = lv_label_create(usage_panel_);
+            lv_obj_set_style_text_color(nav, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(nav, nav_hint);
         }
 
         lv_obj_t* content = lv_obj_create(usage_panel_);
@@ -1550,7 +1652,7 @@ private:
         lv_obj_set_style_pad_all(content, 0, 0);
         lv_obj_set_style_pad_row(content, 6, 0);
         lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
         return content;
     }
 
@@ -1622,18 +1724,36 @@ private:
         lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
 
+        if (acc.unavailable) {
+            lv_obj_t* alert = lv_label_create(title_row);
+            lv_obj_set_style_text_font(alert, font, 0);
+            lv_obj_set_style_text_color(alert, lv_color_hex(0xEA4335), 0);
+            lv_label_set_text(alert, "!");
+        }
+
         lv_obj_t* name_label = lv_label_create(title_row);
         lv_obj_set_style_text_font(name_label, font, 0);
         lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
         lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name_label, 130);
+        lv_obj_set_flex_grow(name_label, 1);
         lv_label_set_text(name_label, acc.name.c_str());
 
+        std::string reset = FormatResetShort(acc.reset_5h);
+        if (!reset.empty()) {
+            lv_obj_t* reset_label = lv_label_create(title_row);
+            lv_obj_set_style_text_font(reset_label, font, 0);
+            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(reset_label, reset.c_str());
+        }
+
         if (!acc.plan.empty()) {
+            uint32_t text_color = 0;
+            uint32_t bg_color = 0;
+            PlanBadgeColors(acc.plan, text_color, bg_color);
             lv_obj_t* plan_label = lv_label_create(title_row);
             lv_obj_set_style_text_font(plan_label, font, 0);
-            lv_obj_set_style_text_color(plan_label, lv_color_hex(0x8AB4F8), 0);
-            lv_obj_set_style_bg_color(plan_label, lv_color_hex(0x283142), 0);
+            lv_obj_set_style_text_color(plan_label, lv_color_hex(text_color), 0);
+            lv_obj_set_style_bg_color(plan_label, lv_color_hex(bg_color), 0);
             lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(plan_label, 6, 0);
             lv_obj_set_style_pad_hor(plan_label, 8, 0);
@@ -1653,29 +1773,50 @@ private:
         }
         DisplayLockGuard lock(GetDisplay());
         auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
-        lv_obj_t* loading = lv_label_create(content);
-        lv_obj_set_style_text_font(loading, font, 0);
-        lv_obj_set_style_text_color(loading, lv_color_hex(0x9AA0A6), 0);
-        lv_label_set_text(loading, "查询中...");
+
+        lv_obj_t* row = lv_obj_create(content);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        loading_label_ = lv_label_create(row);
+        lv_obj_set_style_text_font(loading_label_, font, 0);
+        lv_obj_set_style_text_color(loading_label_, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(loading_label_, "查询中");
+        StartLoadingDotsAnimation();
         RestartUsagePanelTimer(25000000LL);
     }
 
-    static std::string FormatResetLabel(int seconds) {
-        if (seconds <= 0) {
-            return "";
+    // LV_USE_SPINNER 未启用，用文字点动画做加载指示
+    void StartLoadingDotsAnimation() {
+        if (usage_loading_timer_ == nullptr) {
+            esp_timer_create_args_t timer_args = {
+                .callback = [](void* arg) {
+                    DisplayLockGuard lock(instance_->GetDisplay());
+                    if (instance_->loading_label_ != nullptr && lv_obj_is_valid(instance_->loading_label_)) {
+                        instance_->loading_dots_ = (instance_->loading_dots_ + 1) % 4;
+                        lv_label_set_text(instance_->loading_label_,
+                                          ("查询中" + std::string(instance_->loading_dots_, '.')).c_str());
+                    }
+                },
+                .arg = nullptr,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "usage_loading",
+                .skip_unhandled_events = true,
+            };
+            ESP_ERROR_CHECK(esp_timer_create(&timer_args, &usage_loading_timer_));
         }
-        char label[32];
-        if (seconds >= 86400) {
-            snprintf(label, sizeof(label), "%d日%d时后重置", seconds / 86400, (seconds % 86400) / 3600);
-        } else if (seconds >= 3600) {
-            snprintf(label, sizeof(label), "%.1f时后重置", seconds / 3600.0);
-        } else {
-            snprintf(label, sizeof(label), "%d分后重置", seconds / 60);
-        }
-        return label;
+        loading_dots_ = 0;
+        esp_timer_start_periodic(usage_loading_timer_, 500000);
     }
 
-    // 详情页：一栏标签行（窗口名 + 重置倒计时）+ 大进度条
+    // 详情页窗口块：标签行（名称+重置 左，剩余百分比 右）+ 大进度条，共两行
     void AddDetailBarBlock(lv_obj_t* parent, const char* title, int remaining_pct, int reset_seconds) {
         auto display = GetDisplay();
         auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
@@ -1690,17 +1831,20 @@ private:
         lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
 
+        std::string left = title;
+        std::string reset = FormatResetShort(reset_seconds);
+        if (!reset.empty()) {
+            left += "  " + reset + "后重置";
+        }
         lv_obj_t* title_label = lv_label_create(head);
         lv_obj_set_style_text_font(title_label, font, 0);
         lv_obj_set_style_text_color(title_label, lv_color_hex(0x9AA0A6), 0);
-        lv_label_set_text(title_label, title);
+        lv_label_set_text(title_label, left.c_str());
 
-        if (reset_seconds > 0) {
-            lv_obj_t* reset_label = lv_label_create(head);
-            lv_obj_set_style_text_font(reset_label, font, 0);
-            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
-            lv_label_set_text(reset_label, FormatResetLabel(reset_seconds).c_str());
-        }
+        lv_obj_t* pct_label = lv_label_create(head);
+        lv_obj_set_style_text_font(pct_label, font, 0);
+        lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
+        lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
 
         lv_obj_t* bar = lv_bar_create(parent);
         lv_obj_set_width(bar, lv_pct(100));
@@ -1713,13 +1857,6 @@ private:
         lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
         lv_obj_set_style_radius(bar, 4, LV_PART_MAIN);
         lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
-
-        lv_obj_t* pct_label = lv_label_create(parent);
-        lv_obj_set_style_text_font(pct_label, font, 0);
-        lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
-        lv_obj_set_width(pct_label, lv_pct(100));
-        lv_obj_set_style_text_align(pct_label, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
     }
 
     static std::string FormatTokens(long long value) {
@@ -1801,9 +1938,9 @@ private:
         usage_detail_index_ = index;
         const AccountDetail& acc = usage_details_[index];
 
-        std::string subtitle = "< " + std::to_string(index + 1) + "/" + std::to_string(usage_details_.size()) +
-                               " >  音量键切换";
-        lv_obj_t* content = CreateUsagePanelBase("账号详情", subtitle.c_str());
+        std::string nav = "< " + std::to_string(index + 1) + "/" + std::to_string(usage_details_.size()) +
+                         " >  音量键切换 · M键返回";
+        lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str());
         if (content == nullptr) {
             GetDisplay()->ShowNotification("详情页创建失败", 3000);
             return;
@@ -1832,10 +1969,13 @@ private:
         lv_label_set_text(email_label, acc.email.empty() ? acc.name.c_str() : acc.email.c_str());
 
         if (!acc.plan.empty()) {
+            uint32_t plan_text = 0;
+            uint32_t plan_bg = 0;
+            PlanBadgeColors(acc.plan, plan_text, plan_bg);
             lv_obj_t* plan_label = lv_label_create(title_row);
             lv_obj_set_style_text_font(plan_label, font, 0);
-            lv_obj_set_style_text_color(plan_label, lv_color_hex(0x8AB4F8), 0);
-            lv_obj_set_style_bg_color(plan_label, lv_color_hex(0x283142), 0);
+            lv_obj_set_style_text_color(plan_label, lv_color_hex(plan_text), 0);
+            lv_obj_set_style_bg_color(plan_label, lv_color_hex(plan_bg), 0);
             lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(plan_label, 6, 0);
             lv_obj_set_style_pad_hor(plan_label, 8, 0);
@@ -1887,6 +2027,7 @@ private:
 
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(30000000LL));
         StartUsageAutoRefresh();
+        StartUsagePanelWatchdog();
     }
 
     // M 键在详情页再按时回到列表
@@ -1895,19 +2036,7 @@ private:
             HideUsagePanel();
             return;
         }
-        int min_remaining = 101;
-        int min_reset = -1;
-        for (auto& acc : usage_details_) {
-            if (acc.remaining_5h >= 0 && acc.remaining_5h < min_remaining) {
-                min_remaining = acc.remaining_5h;
-                min_reset = acc.reset_5h;
-            }
-        }
-        std::string subtitle = std::to_string(usage_details_.size()) + "账号";
-        if (min_reset > 0) {
-            subtitle += " · " + FormatResetLabel(min_reset) + "(最紧)";
-        }
-        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
+        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
         if (content == nullptr) {
             HideUsagePanel();
             return;
@@ -1919,48 +2048,14 @@ private:
         }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
+        StartUsagePanelWatchdog();
     }
 
 
     // 列表页；自动刷新后恢复原详情页
     void ShowUsageListPanel(std::vector<AccountDetail> details) {
-        std::vector<std::string> plans;
-        int min_remaining = 101;
-        int min_reset = -1;
-        for (auto& acc : details) {
-            if (acc.plan.empty()) {
-                continue;
-            }
-            bool exists = false;
-            for (auto& item : plans) {
-                if (strcasecmp(item.c_str(), acc.plan.c_str()) == 0) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                plans.push_back(acc.plan);
-            }
-            if (acc.remaining_5h >= 0 && acc.remaining_5h < min_remaining) {
-                min_remaining = acc.remaining_5h;
-                min_reset = acc.reset_5h;
-            }
-        }
-
-        std::string subtitle = std::to_string(details.size()) + "账号";
-        if (!plans.empty()) {
-            subtitle += " · ";
-            for (size_t i = 0; i < plans.size(); i++) {
-                if (i > 0) subtitle += ",";
-                subtitle += plans[i];
-            }
-        }
-        if (min_reset > 0) {
-            subtitle += " · " + FormatResetLabel(min_reset) + "(最紧)";
-        }
-
         usage_details_ = std::move(details);
-        usage_detail_index_ = -1;
+        usage_updated_at_ = time(nullptr);
 
         int restore = pending_detail_restore_;
         pending_detail_restore_ = -1;
@@ -1969,11 +2064,12 @@ private:
             return;
         }
 
-        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", subtitle.c_str());
+        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
         if (content == nullptr) {
             GetDisplay()->ShowNotification("用量面板创建失败", 3000);
             return;
         }
+        usage_detail_index_ = -1;
 
         DisplayLockGuard lock(GetDisplay());
         for (auto& acc : usage_details_) {
@@ -1981,6 +2077,7 @@ private:
         }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
+        StartUsagePanelWatchdog();
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
@@ -2144,6 +2241,7 @@ private:
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
             if (self->usage_config_mode_) {
+                self->GetDisplay()->ShowNotification("长按Q键退出配置", 2000);
                 return;
             }
             auto& app = Application::GetInstance();
