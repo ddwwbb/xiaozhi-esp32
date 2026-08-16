@@ -90,13 +90,15 @@ private:
         long current_streak_days = -1;
         int reset_credits = -1;  // 可用限额重置积分
         double lifetime_cost = -1;  // 累计费用（美元），本机统计用，-1 未知
-        // 本机 Claude Code 统计卡片（PC 端 box2-usage-server）：窗口语义是 今日/本周 而非 5h/周，
-        // 核心信息是 token 数与费用（无官方配额概念，进度条仅自定义上限时显示）
+        // 本机 Claude Code 统计卡片（PC 端 box2-usage-server）：无官方配额概念，
+        // 列表拆为 当天/本周/累计 三张维度卡片，各自对应一个详情页
         bool local_stats = false;
         long long today_tokens = -1;
         long long week_tokens = -1;
         double today_cost = -1;
         double week_cost = -1;
+        int requests = -1;          // 当天/本周条目的请求数
+        std::string stat_line;      // 卡片数值行文本（空=隐藏，官方账号无此数据）
         struct ModelStat {
             std::string name;
             long long tokens;
@@ -118,11 +120,18 @@ private:
     // Q 键查询结果的全屏用量面板（LVGL，用时创建、关闭即删除）
     lv_obj_t* usage_panel_ = nullptr;
     esp_timer_handle_t usage_panel_timer_ = nullptr;
-    // 面板数据缓存：列表页与详情页共用；-1 表示当前是列表页
-    std::vector<AccountDetail> usage_details_;
-    int usage_detail_index_ = -1;
+    // 面板数据缓存：按来源分组，各自独立的列表页与详情页。
+    // usage_source_: 0=官方 API 账号（ChatGPT+智谱），1=本机统计；Q 键在两组面板间循环切换
+    static constexpr int kUsageSourceApi = 0;
+    static constexpr int kUsageSourceLocal = 1;
+    int usage_source_ = kUsageSourceApi;
+    std::vector<AccountDetail> api_details_;
+    std::vector<AccountDetail> local_details_;
+    int api_detail_index_ = -1;   // 当前详情页账号（-1=列表页）
+    int local_detail_index_ = -1;
     // 列表分页：240x320 屏每页完整显示 3 张卡片
-    int usage_list_page_ = 0;
+    int api_list_page_ = 0;
+    int local_list_page_ = 0;
     static constexpr int kUsageCardsPerPage = 3;
     // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
     esp_timer_handle_t usage_refresh_timer_ = nullptr;
@@ -130,6 +139,8 @@ private:
     esp_timer_handle_t usage_loading_timer_ = nullptr;
     lv_obj_t* loading_label_ = nullptr;
     int loading_dots_ = 0;
+    // 自动刷新后恢复位置（源 + 详情索引，-1=列表页）
+    int pending_restore_source_ = -1;
     int pending_detail_restore_ = -1;
     time_t usage_updated_at_ = 0;
 
@@ -198,21 +209,73 @@ private:
         return settings.GetInt("usage_refresh_minutes", 0);
     }
 
-    // 本机统计服务（PC 端 box2-usage-server）地址；host 为空表示功能关闭
-    std::string GetLocalUsageHost() {
-        Settings settings("vendor");
-        return settings.GetString("local_usage_host", "");
+    // 本机统计服务（PC 端 box2-usage-server）地址，最多 4 台
+    struct LocalUsageConfig {
+        std::string host;
+        int port = 3939;
+        std::string key;  // 可空
+    };
+
+    static std::string LocalUsageKey(int index, const char* field) {
+        return "local_usage_" + std::to_string(index + 1) + "_" + field;
     }
 
-    int GetLocalUsagePort() {
+    std::vector<LocalUsageConfig> LoadLocalUsages() {
+        std::vector<LocalUsageConfig> out;
         Settings settings("vendor");
-        int port = settings.GetInt("local_usage_port", 3939);
-        return (port > 0 && port < 65536) ? port : 3939;
+        int count = settings.GetInt("local_usage_count", 0);
+        for (int i = 0; i < count && i < 4; i++) {
+            LocalUsageConfig cfg;
+            cfg.host = settings.GetString(LocalUsageKey(i, "host"), "");
+            if (cfg.host.empty() || !ValidLocalHost(cfg.host)) {
+                continue;
+            }
+            cfg.port = settings.GetInt(LocalUsageKey(i, "port"), 3939);
+            if (cfg.port <= 0 || cfg.port >= 65536) {
+                cfg.port = 3939;
+            }
+            cfg.key = settings.GetString(LocalUsageKey(i, "key"), "");
+            out.push_back(std::move(cfg));
+        }
+        if (out.empty()) {
+            // 迁移旧版单地址配置（local_usage_host）为第 1 条
+            std::string legacy = settings.GetString("local_usage_host", "");
+            if (!legacy.empty()) {
+                LocalUsageConfig cfg;
+                cfg.host = legacy;
+                cfg.port = settings.GetInt("local_usage_port", 3939);
+                if (cfg.port <= 0 || cfg.port >= 65536) {
+                    cfg.port = 3939;
+                }
+                cfg.key = settings.GetString("local_usage_key", "");
+                out.push_back(std::move(cfg));
+            }
+        }
+        return out;
     }
 
-    std::string GetLocalUsageKey() {
-        Settings settings("vendor");
-        return settings.GetString("local_usage_key", "");
+    void SaveLocalUsages(const std::vector<LocalUsageConfig>& configs) {
+        Settings settings("vendor", true);
+        int old_count = settings.GetInt("local_usage_count", 0);
+        for (int i = (int)configs.size(); i < old_count && i < 4; i++) {
+            settings.EraseKey(LocalUsageKey(i, "host"));
+            settings.EraseKey(LocalUsageKey(i, "port"));
+            settings.EraseKey(LocalUsageKey(i, "key"));
+        }
+        for (size_t i = 0; i < configs.size() && i < 4; i++) {
+            settings.SetString(LocalUsageKey((int)i, "host"), configs[i].host);
+            settings.SetInt(LocalUsageKey((int)i, "port"), configs[i].port);
+            if (!configs[i].key.empty()) {
+                settings.SetString(LocalUsageKey((int)i, "key"), configs[i].key);
+            } else {
+                settings.EraseKey(LocalUsageKey((int)i, "key"));
+            }
+        }
+        settings.SetInt("local_usage_count", (int)configs.size());
+        // 旧版单地址键不再使用
+        settings.EraseKey("local_usage_host");
+        settings.EraseKey("local_usage_port");
+        settings.EraseKey("local_usage_key");
     }
 
     // 直连模式可选代理（socks5 或 http CONNECT，均支持账号密码认证）
@@ -387,9 +450,7 @@ private:
     static std::string GetConfigPage() {
         auto cfg_proxy = instance_->GetSocks5Config();
         int refresh_minutes = instance_->GetUsageRefreshMinutes();
-        std::string local_host = instance_->GetLocalUsageHost();
-        std::string local_port = std::to_string(instance_->GetLocalUsagePort());
-        std::string local_key = instance_->GetLocalUsageKey();
+        auto local_usages = instance_->LoadLocalUsages();
 
         std::string page =
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -474,15 +535,23 @@ private:
                 "<option value=\"1\"" + std::string(instance_->ZhipuUseProxy() ? " selected" : "") + ">走代理</option>"
                 "</select></p>"
 
-                "<h3>本机统计（可选）</h3>"
-                "<p><small>PC 上运行 box2-usage-server（Claude Code 用量/费用统计）时填其地址，"
-                "面板末尾追加本地CC卡片（当天/本周/近14天/累计token与费用）。地址留空并保存即关闭。</small><br>"
-                "地址 <input name=\"local_usage_host\" value=\"" + local_host +
-                "\" style=\"width:130px\" placeholder=\"192.168.1.2\"> "
-                "端口 <input name=\"local_usage_port\" type=\"number\" value=\"" + local_port +
-                "\" style=\"width:70px\"> "
-                "密钥 <input name=\"local_usage_key\" value=\"" + local_key +
-                "\" style=\"width:100px\" placeholder=\"可留空\"></p>"
+                "<h3>本机统计（可选，最多 4 台 PC）</h3>"
+                "<p><small>PC 上运行 box2-usage-server（Claude Code + Codex 用量/费用统计）时添加其地址，"
+                "\"本地用量\"面板为每台 PC 生成 当天/本周/累计 三张卡片。全部删除即关闭。</small></p>";
+        for (size_t i = 0; i < local_usages.size(); i++) {
+            page += "<form method=\"POST\" action=\"/local_delete\" style=\"margin:2px 0\">"
+                    "<input type=\"hidden\" name=\"index\" value=\"" + std::to_string(i) + "\">"
+                    "<button type=\"submit\" style=\"width:100%;text-align:left\">" +
+                    std::to_string(i + 1) + ". " + local_usages[i].host + ":" +
+                    std::to_string(local_usages[i].port) +
+                    (local_usages[i].key.empty() ? "" : " (密钥)") + "  [删除]</button></form>";
+        }
+        page += "<form method=\"POST\" action=\"/local_add\">"
+                "地址 <input name=\"host\" style=\"width:130px\" placeholder=\"192.168.1.2\"> "
+                "端口 <input name=\"port\" type=\"number\" value=\"3939\" style=\"width:70px\"> "
+                "密钥 <input name=\"key\" style=\"width:100px\" placeholder=\"可留空\"> "
+                "<p><button type=\"submit\">添加</button> <small>同一地址重复添加会覆盖</small></p>"
+                "</form>"
 
                 "<h3>自动刷新</h3>"
                 "<p>间隔分钟（0=关闭，面板 15 秒自动关闭；大于 0 时面板常驻并按此间隔自动刷新）<br>"
@@ -763,6 +832,75 @@ private:
         return ESP_OK;
     }
 
+    static esp_err_t UsageConfigLocalAddHandler(httpd_req_t* req) {
+        char body[384] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        std::string host = GetFormField(body, "host");
+        int port = atoi(GetFormField(body, "port").c_str());
+        std::string key = GetFormField(body, "key");
+        if (key.empty() || ValidLocalKey(key)) {
+            if (port <= 0 || port >= 65536) {
+                port = 3939;
+            }
+            if (!ValidLocalHost(host)) {
+                SendSimplePage(req, "<h3>添加失败：地址无效（仅 IPv4/域名）</h3>", "返回");
+                return ESP_OK;
+            }
+            auto configs = instance_->LoadLocalUsages();
+            int replace_index = -1;
+            for (size_t i = 0; i < configs.size(); i++) {
+                if (configs[i].host == host) {
+                    replace_index = (int)i;
+                    break;
+                }
+            }
+            if (replace_index < 0 && configs.size() >= 4) {
+                SendSimplePage(req, "<h3>添加失败：最多 4 台 PC</h3>", "返回");
+                return ESP_OK;
+            }
+            LocalUsageConfig cfg;
+            cfg.host = host;
+            cfg.port = port;
+            cfg.key = key;
+            if (replace_index >= 0) {
+                configs[replace_index] = std::move(cfg);
+            } else {
+                configs.push_back(std::move(cfg));
+            }
+            instance_->SaveLocalUsages(configs);
+            SendSimplePage(req, "<h3>已添加，当前共 " + std::to_string(configs.size()) + " 台 PC</h3>", "返回");
+        } else {
+            // 非法密钥拒绝：该值会拼进 URL query 与 HTML 属性
+            SendSimplePage(req, "<h3>添加失败：密钥仅限 ASCII 可见字符（不能含 &amp; # % 引号尖括号）</h3>", "返回");
+        }
+        return ESP_OK;
+    }
+
+    static esp_err_t UsageConfigLocalDeleteHandler(httpd_req_t* req) {
+        char body[128] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        int index = atoi(GetFormField(body, "index").c_str());
+        auto configs = instance_->LoadLocalUsages();
+        if (index < 0 || index >= (int)configs.size()) {
+            SendSimplePage(req, "<h3>删除失败：索引无效</h3>", "返回");
+            return ESP_OK;
+        }
+        configs.erase(configs.begin() + index);
+        instance_->SaveLocalUsages(configs);
+        SendSimplePage(req, "<h3>已删除，剩余 " + std::to_string(configs.size()) + " 台 PC</h3>", "返回");
+        return ESP_OK;
+    }
+
     static esp_err_t UsageConfigSaveHandler(httpd_req_t* req) {
         char body[1024] = {0};
         size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
@@ -780,9 +918,6 @@ private:
         auto proxy_pass = GetFormField(body, "proxy_pass");
         auto chatgpt_proxy = GetFormField(body, "chatgpt_proxy");
         auto zhipu_proxy = GetFormField(body, "zhipu_proxy");
-        auto local_host = GetFormField(body, "local_usage_host");
-        auto local_port = GetFormField(body, "local_usage_port");
-        auto local_key = GetFormField(body, "local_usage_key");
 
         Settings settings("vendor", true);
         if (!proxy_type.empty()) {
@@ -814,26 +949,6 @@ private:
             if (minutes < 0) minutes = 0;
             if (minutes > 1440) minutes = 1440;
             settings.SetInt("usage_refresh_minutes", minutes);
-        }
-        // 本机统计地址：该输入框总随表单提交，留空保存即清除（关闭本机卡片）
-        if (ValidLocalHost(local_host)) {
-            settings.SetString("local_usage_host", local_host);
-        } else {
-            settings.EraseKey("local_usage_host");
-        }
-        if (!local_port.empty()) {
-            int port = atoi(local_port.c_str());
-            if (port > 0 && port < 65536) {
-                settings.SetInt("local_usage_port", port);
-            }
-        }
-        if (!local_key.empty()) {
-            // 非法密钥直接清除：该值会拼进 URL query 与 HTML 属性，不落 NVS
-            if (ValidLocalKey(local_key)) {
-                settings.SetString("local_usage_key", local_key);
-            } else {
-                settings.EraseKey("local_usage_key");
-            }
         }
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
@@ -936,6 +1051,18 @@ private:
         clear_proxy_uri.handler = UsageConfigClearProxyHandler;
         httpd_register_uri_handler(usage_config_server_, &clear_proxy_uri);
 
+        httpd_uri_t local_add_uri = {};
+        local_add_uri.uri = "/local_add";
+        local_add_uri.method = HTTP_POST;
+        local_add_uri.handler = UsageConfigLocalAddHandler;
+        httpd_register_uri_handler(usage_config_server_, &local_add_uri);
+
+        httpd_uri_t local_delete_uri = {};
+        local_delete_uri.uri = "/local_delete";
+        local_delete_uri.method = HTTP_POST;
+        local_delete_uri.handler = UsageConfigLocalDeleteHandler;
+        httpd_register_uri_handler(usage_config_server_, &local_delete_uri);
+
         if (usage_config_exit_timer_ == nullptr) {
             esp_timer_create_args_t timer_args = {
                 .callback = [](void* arg) { instance_->ExitUsageConfigMode(); },
@@ -969,11 +1096,25 @@ private:
         }
     }
 
-    // 直连官方接口模式：使用导入的 codex 令牌；401 时自动刷新并重试
+    // 卡片名后缀：IPv4 取末段（192.168.1.134 → 134），域名截前 8 字符
+    static std::string HostSuffix(const std::string& host) {
+        if (host.find_first_not_of("0123456789.") == std::string::npos) {
+            size_t dot = host.rfind('.');
+            if (dot != std::string::npos) {
+                return host.substr(dot + 1);
+            }
+        }
+        return host.size() > 8 ? host.substr(0, 8) : host;
+    }
+
+    // 直连官方接口模式：使用导入的 codex 令牌；401 时自动刷新并重试。
+    // 结果按来源分组（官方 API / 本机统计），两组各自有列表页与详情页
     void QueryDirectUsage() {
         std::vector<std::string> jsons = LoadDirectAuthJsons();
-        std::vector<AccountDetail> details;
-        int ok_count = 0;
+        std::vector<AccountDetail> api_details;
+        std::vector<AccountDetail> local_details;
+        bool api_ok = false;
+        bool local_ok = false;
 
         for (size_t i = 0; i < jsons.size(); i++) {
             cJSON* root = cJSON_Parse(jsons[i].c_str());
@@ -1026,12 +1167,12 @@ private:
                 FetchOfficialExtras(final_token, acc.account_id, acc);
             }
             if (status == 200) {
-                ok_count++;
+                api_ok = true;
             } else if (status == 400 || status == 401 || status == 403) {
                 acc.unavailable = true;
             }
             cJSON_Delete(root);
-            details.push_back(std::move(acc));
+            api_details.push_back(std::move(acc));
         }
 
         // 智谱官方 API Key：独立于 ChatGPT 账号，查 GLM 套餐 token 用量
@@ -1047,48 +1188,48 @@ private:
             acc.email = "智谱开放平台 ****" + tail;
             int status = FetchZhipuUsage(zhipu_keys[i], acc);
             if (status == 200) {
-                ok_count++;
+                api_ok = true;
             } else if (status == 400 || status == 401 || status == 403 || status == -2) {
                 acc.unavailable = true;
             }
-            details.push_back(std::move(acc));
+            api_details.push_back(std::move(acc));
         }
 
-        // 本机 Claude Code 统计：PC 端 box2-usage-server（地址在配置页设置）。
-        // 服务不可达只标记本卡片 unavailable，不影响其他账号
-        std::string local_host = GetLocalUsageHost();
-        if (!local_host.empty()) {
-            AccountDetail acc;
-            acc.name = "本地CC";
-            acc.email = "Claude Code @ " + local_host;
-            acc.local_stats = true;
-            int status = FetchLocalUsage(local_host, GetLocalUsagePort(), acc);
+        // 本机统计：每台 PC（box2-usage-server）独立查询，各生成 当天/本周/累计 三张卡片。
+        // 多 PC 时卡片名带地址尾段区分；某台不可达只标记该 PC 的卡片 unavailable
+        auto local_usages = LoadLocalUsages();
+        for (size_t i = 0; i < local_usages.size(); i++) {
+            const auto& cfg = local_usages[i];
+            std::string suffix = local_usages.size() > 1 ? HostSuffix(cfg.host) : "";
+            int status = FetchLocalUsage(cfg.host, cfg.port, cfg.key, suffix, local_details);
             if (status == 200) {
-                ok_count++;
+                local_ok = true;
             } else {
+                AccountDetail acc;
+                acc.name = suffix.empty() ? "本地" : "本地@" + suffix;
+                acc.email = "Claude Code @ " + cfg.host;
+                acc.local_stats = true;
                 acc.unavailable = true;
+                local_details.push_back(std::move(acc));
             }
-            details.push_back(std::move(acc));
         }
 
-        if (details.empty() || ok_count == 0) {
+        if (!api_ok && !local_ok) {
             HideUsagePanel();
-            // 全部为本机卡片时，失败原因一定是本地服务而非官方令牌
-            bool all_local = !details.empty();
-            for (const auto& d : details) {
-                all_local = all_local && d.local_stats;
-            }
-            GetDisplay()->ShowNotification(all_local ? "本机统计服务不可达,检查PC端"
-                                                     : "直连查询失败:令牌失效或网络不可达",
+            // 只有本机卡片时，失败原因一定是本地服务而非官方令牌
+            GetDisplay()->ShowNotification(api_details.empty() && !local_details.empty()
+                                               ? "本机统计服务不可达,检查PC端"
+                                               : "直连查询失败:令牌失效或网络不可达",
                                            4000);
             return;
         }
-        ShowUsageListPanel(std::move(details));
+        ShowUsageListPanel(std::move(api_details), std::move(local_details), api_ok, local_ok);
     }
 
     void QueryUsage() {
-        pending_detail_restore_ = usage_detail_index_;
-        if (LoadDirectAuthJsons().empty() && LoadZhipuKeys().empty() && GetLocalUsageHost().empty()) {
+        pending_restore_source_ = usage_source_;
+        pending_detail_restore_ = CurrentDetailIndex();
+        if (LoadDirectAuthJsons().empty() && LoadZhipuKeys().empty() && LoadLocalUsages().empty()) {
             GetDisplay()->ShowNotification("未导入令牌,长按Q键配置", 3000);
             return;
         }
@@ -1896,12 +2037,13 @@ private:
     }
 
     // 本机统计服务（PC 端 box2-usage-server，明文 HTTP）GET /usage。
-    // 服务端按 message.id 去重聚合 ~/.claude/projects 的 JSONL：今日/本周 token 与费用、
+    // 服务端聚合 Claude Code 与 Codex CLI 的本地会话记录：当天/本周 token 与费用、
     // 近 14 天逐日、累计/峰值/连续天数、按模型分类。percent 为已用百分比（-1 未配置上限）。
-    // 返回 200 成功；HTTP 状态码原样返回；-1 网络失败；-2 响应解析失败
-    static int FetchLocalUsage(const std::string& host, int port, AccountDetail& acc) {
+    // 成功时 locals 追加三张维度卡片（当天/本周/累计），各对应一个详情页；
+    // 失败时追加一个 unavailable 条目。返回 200 成功；HTTP 状态码；-1 网络；-2 解析失败
+    static int FetchLocalUsage(const std::string& host, int port, const std::string& key,
+                               const std::string& name_suffix, std::vector<AccountDetail>& locals) {
         std::string path = "/usage";
-        std::string key = instance_->GetLocalUsageKey();
         if (!key.empty()) {
             path += "?key=" + key;
         }
@@ -1921,10 +2063,6 @@ private:
             ESP_LOGE(TAG, "Local usage: bad json");
             return -2;
         }
-        cJSON* plan_item = cJSON_GetObjectItem(root, "plan");
-        if (cJSON_IsString(plan_item) && plan_item->valuestring[0] != '\0') {
-            acc.plan = plan_item->valuestring;
-        }
         auto number_value = [](cJSON* parent, const char* key) -> long long {
             cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, key) : nullptr;
             return cJSON_IsNumber(item) ? (long long)item->valuedouble : -1;
@@ -1938,33 +2076,38 @@ private:
             int remaining = 100 - pct->valueint;
             return remaining < 0 ? 0 : remaining;
         };
-        cJSON* today = cJSON_GetObjectItem(root, "today");
-        cJSON* week = cJSON_GetObjectItem(root, "week");
-        acc.remaining_5h = window_remaining(today);
-        acc.remaining_weekly = window_remaining(week);
-        acc.today_tokens = number_value(today, "tokens");
-        acc.week_tokens = number_value(week, "tokens");
         auto cost_value = [](cJSON* parent) -> double {
             cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, "cost") : nullptr;
             return cJSON_IsNumber(item) && item->valuedouble >= 0 ? item->valuedouble : -1;
         };
-        acc.today_cost = cost_value(today);
-        acc.week_cost = cost_value(week);
-        acc.reset_5h = (int)number_value(root, "reset_after_seconds");
-        acc.reset_weekly = (int)number_value(root, "weekly_reset_after_seconds");
-        if (acc.reset_5h <= 0) {
-            acc.reset_5h = -1;
+
+        cJSON* today = cJSON_GetObjectItem(root, "today");
+        cJSON* week = cJSON_GetObjectItem(root, "week");
+        long long today_tokens = number_value(today, "tokens");
+        long long week_tokens = number_value(week, "tokens");
+        double today_cost = cost_value(today);
+        double week_cost = cost_value(week);
+        int today_requests = (int)number_value(today, "requests");
+        int week_requests = (int)number_value(week, "requests");
+        int reset_day = (int)number_value(root, "reset_after_seconds");
+        int reset_week = (int)number_value(root, "weekly_reset_after_seconds");
+        if (reset_day <= 0) {
+            reset_day = -1;
         }
-        if (acc.reset_weekly <= 0) {
-            acc.reset_weekly = -1;
+        if (reset_week <= 0) {
+            reset_week = -1;
         }
-        acc.lifetime_tokens = number_value(root, "lifetime_tokens");
-        acc.peak_daily_tokens = number_value(root, "peak_daily_tokens");
-        acc.current_streak_days = (long)number_value(root, "streak_days");
+        long long lifetime_tokens = number_value(root, "lifetime_tokens");
+        long long peak_daily_tokens = number_value(root, "peak_daily_tokens");
+        long streak_days = (long)number_value(root, "streak_days");
+        double lifetime_cost = -1;
         cJSON* cost = cJSON_GetObjectItem(root, "lifetime_cost");
         if (cJSON_IsNumber(cost) && cost->valuedouble >= 0) {
-            acc.lifetime_cost = cost->valuedouble;
+            lifetime_cost = cost->valuedouble;
         }
+
+        // 三张维度卡片：当天/本周/累计，共用同一来源标识
+        std::vector<AccountDetail::ModelStat> model_stats;
         cJSON* model_item = nullptr;
         cJSON_ArrayForEach(model_item, cJSON_GetObjectItem(root, "models")) {
             cJSON* name_item = cJSON_GetObjectItem(model_item, "model");
@@ -1978,24 +2121,70 @@ private:
             stat.cost = cost_value(model_item);
             cJSON* priced_item = cJSON_GetObjectItem(model_item, "priced");
             stat.priced = !cJSON_IsFalse(priced_item);
-            acc.local_models.push_back(std::move(stat));
+            model_stats.push_back(std::move(stat));
         }
+        std::vector<std::pair<std::string, long long>> buckets;
         cJSON* bucket = nullptr;
         cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(root, "daily_buckets")) {
             cJSON* date_item = cJSON_GetObjectItem(bucket, "date");
             cJSON* tokens_item = cJSON_GetObjectItem(bucket, "tokens");
             if (cJSON_IsString(date_item) && cJSON_IsNumber(tokens_item)) {
-                acc.daily_buckets.emplace_back(date_item->valuestring,
-                                               (long long)tokens_item->valuedouble);
+                buckets.emplace_back(date_item->valuestring, (long long)tokens_item->valuedouble);
             }
         }
         cJSON_Delete(root);
+
+        std::string source = "Claude Code @ " + host;
+        auto make_entry = [&](const char* name) {
+            AccountDetail acc;
+            acc.name = name_suffix.empty() ? name : name + ("@" + name_suffix);
+            acc.email = source;
+            acc.local_stats = true;
+            return acc;
+        };
+        // 数值行/详情数值统一带请求数："1.2万 · 15次 ($0.03)"
+        auto usage_line = [](long long tokens, int requests, double cost) {
+            std::string line = FormatTokens(tokens);
+            if (requests >= 0) {
+                line += " · " + std::to_string(requests) + "次";
+            }
+            line += CostSuffix(cost);
+            return line;
+        };
+
+        AccountDetail day_acc = make_entry("当天");
+        day_acc.plan = "本地";
+        day_acc.remaining_5h = window_remaining(today);
+        day_acc.reset_5h = reset_day;
+        day_acc.today_tokens = today_tokens;
+        day_acc.today_cost = today_cost;
+        day_acc.requests = today_requests;
+        day_acc.stat_line = usage_line(today_tokens, today_requests, today_cost);
+        day_acc.daily_buckets = buckets;
+
+        AccountDetail week_acc = make_entry("本周");
+        week_acc.remaining_weekly = window_remaining(week);
+        week_acc.reset_weekly = reset_week;
+        week_acc.week_tokens = week_tokens;
+        week_acc.week_cost = week_cost;
+        week_acc.requests = week_requests;
+        week_acc.stat_line = usage_line(week_tokens, week_requests, week_cost);
+        week_acc.daily_buckets = buckets;
+
+        AccountDetail total_acc = make_entry("累计");
+        total_acc.lifetime_tokens = lifetime_tokens;
+        total_acc.lifetime_cost = lifetime_cost;
+        total_acc.peak_daily_tokens = peak_daily_tokens;
+        total_acc.current_streak_days = streak_days;
+        total_acc.stat_line = FormatTokens(lifetime_tokens) + CostSuffix(lifetime_cost);
+        total_acc.local_models = std::move(model_stats);
+        total_acc.daily_buckets = std::move(buckets);
+
+        locals.push_back(std::move(day_acc));
+        locals.push_back(std::move(week_acc));
+        locals.push_back(std::move(total_acc));
         ESP_LOGI(TAG, "Local usage: today=%lld week=%lld lifetime=%lld cost=%.2f",
-                 today != nullptr && cJSON_IsNumber(cJSON_GetObjectItem(today, "tokens"))
-                     ? (long long)cJSON_GetObjectItem(today, "tokens")->valuedouble : -1,
-                 week != nullptr && cJSON_IsNumber(cJSON_GetObjectItem(week, "tokens"))
-                     ? (long long)cJSON_GetObjectItem(week, "tokens")->valuedouble : -1,
-                 acc.lifetime_tokens, acc.lifetime_cost);
+                 today_tokens, week_tokens, lifetime_tokens, lifetime_cost);
         return 200;
     }
 
@@ -2112,6 +2301,35 @@ private:
         return lv_color_hex(0x34A853);
     }
 
+    // 当前源的数据组与页面状态（官方 API / 本机统计各自独立）
+    const std::vector<AccountDetail>& CurrentDetails() const {
+        return usage_source_ == kUsageSourceLocal ? local_details_ : api_details_;
+    }
+
+    int CurrentDetailIndex() const {
+        return usage_source_ == kUsageSourceLocal ? local_detail_index_ : api_detail_index_;
+    }
+
+    void SetCurrentDetailIndex(int index) {
+        if (usage_source_ == kUsageSourceLocal) {
+            local_detail_index_ = index;
+        } else {
+            api_detail_index_ = index;
+        }
+    }
+
+    int CurrentListPage() const {
+        return usage_source_ == kUsageSourceLocal ? local_list_page_ : api_list_page_;
+    }
+
+    void SetCurrentListPage(int page) {
+        if (usage_source_ == kUsageSourceLocal) {
+            local_list_page_ = page;
+        } else {
+            api_list_page_ = page;
+        }
+    }
+
     void HideUsagePanel() {
         if (usage_panel_timer_ != nullptr) {
             esp_timer_stop(usage_panel_timer_);
@@ -2127,7 +2345,8 @@ private:
             esp_timer_stop(usage_loading_timer_);
         }
         loading_label_ = nullptr;
-        usage_detail_index_ = -1;
+        api_detail_index_ = -1;
+        local_detail_index_ = -1;
         if (usage_panel_ == nullptr) {
             return;
         }
@@ -2378,7 +2597,8 @@ private:
         lv_obj_set_flex_grow(name_label, 1);
         lv_label_set_text(name_label, acc.name.c_str());
 
-        std::string reset = FormatResetShort(acc.reset_5h);
+        // 倒计时：优先 5h 窗口/当天（到午夜），无则回落周窗口（到下周一）
+        std::string reset = FormatResetShort(acc.reset_5h > 0 ? acc.reset_5h : acc.reset_weekly);
         if (!reset.empty()) {
             lv_obj_t* reset_label = lv_label_create(title_row);
             lv_obj_set_style_text_font(reset_label, font, 0);
@@ -2401,26 +2621,16 @@ private:
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
-        // 本机统计卡片的核心信息是当日/本周消耗（无官方配额概念），进度条仅自定义上限时显示
-        if (acc.local_stats && (acc.today_tokens >= 0 || acc.week_tokens >= 0)) {
-            std::string line;
-            if (acc.today_tokens >= 0) {
-                line += "日 " + FormatTokens(acc.today_tokens) + CostSuffix(acc.today_cost);
-            }
-            if (acc.week_tokens >= 0) {
-                if (!line.empty()) {
-                    line += " ";
-                }
-                line += "周 " + FormatTokens(acc.week_tokens) + CostSuffix(acc.week_cost);
-            }
+        // 数值行（token/费用/请求数）：stat_line 非空即显示，官方账号无此数据自动隐藏。
+        // 主字体：数值含 万/亿/· 单位，不在 14px 小字体的字符集里
+        if (!acc.stat_line.empty()) {
             lv_obj_t* stat_label = lv_label_create(card);
             lv_obj_set_width(stat_label, lv_pct(100));
             lv_obj_set_height(stat_label, 20);
             lv_label_set_long_mode(stat_label, LV_LABEL_LONG_DOT);
-            // 主字体：数值含 万/亿 单位，不在 14px 小字体的字符集里
             lv_obj_set_style_text_font(stat_label, PanelTextFont(), 0);
             lv_obj_set_style_text_color(stat_label, lv_color_hex(0xE8EAED), 0);
-            lv_label_set_text(stat_label, line.c_str());
+            lv_label_set_text(stat_label, acc.stat_line.c_str());
         }
 
         if (acc.remaining_5h >= 0) {
@@ -2651,17 +2861,17 @@ private:
         lv_label_set_text(value_label, value.c_str());
     }
 
-    // M 键从列表进入的单账号详情页；数据来自 usage_details_ 缓存。
+    // M 键从列表进入的单账号详情页；数据来自当前源分组缓存。
     // 智谱账号显示与列表卡片相同的内容（套餐徽章 + 5h/周窗口），无数据的块自动隐藏
     void ShowUsageDetailPanel(int index) {
-        if (usage_details_.empty()) {
+        if (CurrentDetails().empty()) {
             return;
         }
-        index = ((index % (int)usage_details_.size()) + (int)usage_details_.size()) % (int)usage_details_.size();
-        usage_detail_index_ = index;
-        const AccountDetail& acc = usage_details_[index];
+        index = ((index % (int)CurrentDetails().size()) + (int)CurrentDetails().size()) % (int)CurrentDetails().size();
+        SetCurrentDetailIndex(index);
+        const AccountDetail& acc = CurrentDetails()[index];
 
-        std::string nav = "< " + std::to_string(index + 1) + "/" + std::to_string(usage_details_.size()) +
+        std::string nav = "< " + std::to_string(index + 1) + "/" + std::to_string(CurrentDetails().size()) +
                          " >  音量键切换 · M键返回";
         lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str(), false);
         if (content == nullptr) {
@@ -2714,13 +2924,20 @@ private:
         // 右侧显示 token 数与费用，仅自定义上限配置后显示进度条
         bool local_has_today = acc.local_stats && acc.today_tokens >= 0;
         bool local_has_week = acc.local_stats && acc.week_tokens >= 0;
+        auto local_value = [](long long tokens, int requests, double cost) {
+            std::string value = FormatTokens(tokens);
+            if (requests >= 0) {
+                value += " · " + std::to_string(requests) + "次";
+            }
+            return value + CostSuffix(cost);
+        };
         if ((!acc.local_stats && acc.remaining_5h >= 0) || local_has_today) {
-            std::string value = FormatTokens(acc.today_tokens) + CostSuffix(acc.today_cost);
+            std::string value = local_value(acc.today_tokens, acc.requests, acc.today_cost);
             AddDetailBarBlock(content, acc.local_stats ? "当天用量" : "5小时窗口",
                               acc.remaining_5h, acc.reset_5h, acc.local_stats ? &value : nullptr);
         }
         if ((!acc.local_stats && acc.remaining_weekly >= 0) || local_has_week) {
-            std::string value = FormatTokens(acc.week_tokens) + CostSuffix(acc.week_cost);
+            std::string value = local_value(acc.week_tokens, acc.requests, acc.week_cost);
             AddDetailBarBlock(content, acc.local_stats ? "本周用量" : "每周窗口",
                               acc.remaining_weekly, acc.reset_weekly, acc.local_stats ? &value : nullptr);
         }
@@ -2797,30 +3014,34 @@ private:
     }
 
     int UsageListPages() {
-        return ((int)usage_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage;
+        return ((int)CurrentDetails().size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage;
     }
 
-    // 列表页：当前页的 3 张卡片完整显示（不滚动）+ 页码导航行
+    // 列表页：当前页的 3 张卡片完整显示（不滚动）+ 页码导航行。
+    // 标题按源区分（AI 用量 / 本地用量）；Q 键提示受 14px 小字库限制：
+    // 本机组用已有汉字"Q关闭"，官方组用 ASCII "Q Local"（Local=本地统计）
     void ShowUsageListPage() {
         int pages = UsageListPages();
         std::string nav = pages > 1
-                              ? "< " + std::to_string(usage_list_page_ + 1) + "/" + std::to_string(pages) +
+                              ? "< " + std::to_string(CurrentListPage() + 1) + "/" + std::to_string(pages) +
                                     " >  L/R翻页 M详情"
-                              : "M详情 Q关闭";
-        lv_obj_t* content = CreateUsagePanelBase("AI 用量", nav.c_str());
+                              : "M详情";
+        nav += usage_source_ == kUsageSourceLocal ? "  Q关闭" : "  Q Local";
+        const char* title = usage_source_ == kUsageSourceLocal ? "本地用量" : "AI 用量";
+        lv_obj_t* content = CreateUsagePanelBase(title, nav.c_str());
         if (content == nullptr) {
             GetDisplay()->ShowNotification("用量面板创建失败", 3000);
             return;
         }
-        usage_detail_index_ = -1;
+        SetCurrentDetailIndex(-1);
 
         DisplayLockGuard lock(GetDisplay());
         lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
-        int begin = usage_list_page_ * kUsageCardsPerPage;
-        int end = std::min(begin + kUsageCardsPerPage, (int)usage_details_.size());
+        int begin = CurrentListPage() * kUsageCardsPerPage;
+        int end = std::min(begin + kUsageCardsPerPage, (int)CurrentDetails().size());
         for (int i = begin; i < end; i++) {
-            AddUsageCard(content, usage_details_[i]);
+            AddUsageCard(content, CurrentDetails()[i]);
         }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
@@ -2833,13 +3054,13 @@ private:
         if (pages <= 1) {
             return;
         }
-        usage_list_page_ = ((usage_list_page_ + step) % pages + pages) % pages;
+        SetCurrentListPage(((CurrentListPage() + step) % pages + pages) % pages);
         ShowUsageListPage();
     }
 
     // M 键在详情页再按时回到列表（保持当前页）
     void BackToUsageList() {
-        if (usage_details_.empty()) {
+        if (CurrentDetails().empty()) {
             HideUsagePanel();
             return;
         }
@@ -2849,17 +3070,32 @@ private:
         }
     }
 
-    // 新数据到达；自动刷新后恢复原详情页
-    void ShowUsageListPanel(std::vector<AccountDetail> details) {
-        usage_details_ = std::move(details);
+    // 新数据到达：更新两组缓存；自动刷新时恢复原源原页，否则打开初始源（官方 API 优先）
+    void ShowUsageListPanel(std::vector<AccountDetail> api_details, std::vector<AccountDetail> local_details,
+                            bool api_ok, bool local_ok) {
+        api_details_ = std::move(api_details);
+        local_details_ = std::move(local_details);
         usage_updated_at_ = time(nullptr);
-        if (usage_list_page_ >= UsageListPages()) {
-            usage_list_page_ = 0;
+        if (api_list_page_ >= ((int)api_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage) {
+            api_list_page_ = 0;
+        }
+        if (local_list_page_ >= ((int)local_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage) {
+            local_list_page_ = 0;
         }
 
+        int restore_source = pending_restore_source_;
         int restore = pending_detail_restore_;
+        pending_restore_source_ = -1;
         pending_detail_restore_ = -1;
-        if (restore >= 0 && restore < (int)usage_details_.size()) {
+        if (restore_source == kUsageSourceLocal && !local_details_.empty()) {
+            usage_source_ = kUsageSourceLocal;
+        } else if (restore_source == kUsageSourceApi && !api_details_.empty()) {
+            usage_source_ = kUsageSourceApi;
+        } else {
+            // 初始源：官方 API 查询成功则优先（失败卡片仍保留在组内，可手动 Q 切入查看）
+            usage_source_ = api_ok ? kUsageSourceApi : kUsageSourceLocal;
+        }
+        if (restore >= 0 && !CurrentDetails().empty()) {
             ShowUsageDetailPanel(restore);
             return;
         }
@@ -2975,8 +3211,8 @@ private:
         iot_button_register_cb(l_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
-            if (self->usage_detail_index_ >= 0) {
-                self->ShowUsageDetailPanel(self->usage_detail_index_ - 1);
+            if (self->CurrentDetailIndex() >= 0) {
+                self->ShowUsageDetailPanel(self->CurrentDetailIndex() - 1);
                 return;
             }
             if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
@@ -2996,11 +3232,11 @@ private:
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
             if (!self->usage_config_mode_ && self->usage_panel_ != nullptr) {
-                if (self->usage_detail_index_ >= 0) {
+                if (self->CurrentDetailIndex() >= 0) {
                     self->BackToUsageList();
                 } else {
                     // 从当前页的第一个账号进入详情（超出总数时由详情页取模回绕）
-                    self->ShowUsageDetailPanel(self->usage_list_page_ * self->kUsageCardsPerPage);
+                    self->ShowUsageDetailPanel(self->CurrentListPage() * self->kUsageCardsPerPage);
                 }
                 return;
             }
@@ -3042,7 +3278,13 @@ private:
                 app.ToggleChatState();
             } else if (state == kDeviceStateIdle) {
                 if (self->usage_panel_ != nullptr) {
-                    self->HideUsagePanel();
+                    // Q 循环：官方面板 → 本机面板 → 关闭；目标组无数据（未配置/查询失败）时直接关闭
+                    if (self->usage_source_ == self->kUsageSourceApi && !self->local_details_.empty()) {
+                        self->usage_source_ = self->kUsageSourceLocal;
+                        self->ShowUsageListPage();
+                    } else {
+                        self->HideUsagePanel();
+                    }
                 } else {
                     self->StartUsageQuery();
                 }
@@ -3062,8 +3304,8 @@ private:
         iot_button_register_cb(r_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
-            if (self->usage_detail_index_ >= 0) {
-                self->ShowUsageDetailPanel(self->usage_detail_index_ + 1);
+            if (self->CurrentDetailIndex() >= 0) {
+                self->ShowUsageDetailPanel(self->CurrentDetailIndex() + 1);
                 return;
             }
             if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
