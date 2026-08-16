@@ -6,7 +6,8 @@
 
 class Settings {
 public:
-    Settings(const std::string& ns, bool read_write = false);
+    // partition 为 NVS 分区标签，默认主 "nvs" 分区（原行为）
+    Settings(const std::string& ns, bool read_write = false, const std::string& partition = "nvs");
     ~Settings();
 
     std::string GetString(const std::string& key, const std::string& default_value = "");

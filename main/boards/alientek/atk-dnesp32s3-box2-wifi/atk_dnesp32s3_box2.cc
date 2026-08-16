@@ -83,6 +83,76 @@ private:
     using Socks5Config = usage::Socks5Config;
     using LocalUsageConfig = usage::LocalUsageConfig;
 
+    // vendor 数据存板专属 64KB NVS 分区（partitions/v2/16m.csv 的 nvs_vendor）；
+    // 旧固件分区表无此分区时回落默认 "nvs"（容量小，导入大令牌受限但不崩溃）
+    static bool vendor_partition_ok_;
+    static const char* VendorPartition() {
+        return vendor_partition_ok_ ? "nvs_vendor" : "nvs";
+    }
+
+    // 初始化 nvs_vendor 分区，并把默认分区里的旧 vendor 数据一次性迁移过来
+    // （令牌经 OAuth 轮换后 PC 原文件已失效，NVS 里是最新值，必须迁移）
+    static void InitializeVendorNvs() {
+        esp_err_t err = nvs_flash_init_partition("nvs_vendor");
+        if (err != ESP_OK && err != ESP_ERR_NVS_NO_FREE_PAGES && err != ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            vendor_partition_ok_ = false;
+            ESP_LOGW(TAG, "nvs_vendor partition unavailable (%s), fallback to default nvs",
+                     esp_err_to_name(err));
+            return;
+        }
+        vendor_partition_ok_ = true;
+
+        Settings dst("vendor", true, "nvs_vendor");
+        if (dst.GetInt("vendor_migrated", 0) != 0) {
+            return;  // 已迁移
+        }
+        Settings src("vendor");  // 默认分区
+        // 已知 key 集合迁移（本文件定义的全部 vendor 键，string 与 int 分列）
+        for (int i = 0; i < 8; i++) {
+            std::string value = src.GetString("codex_auth_" + std::to_string(i + 1), "");
+            if (!value.empty()) {
+                dst.SetString("codex_auth_" + std::to_string(i + 1), value);
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            std::string value = src.GetString("zhipu_key_" + std::to_string(i + 1), "");
+            if (!value.empty()) {
+                dst.SetString("zhipu_key_" + std::to_string(i + 1), value);
+            }
+        }
+        for (int i = 0; i < 4; i++) {
+            std::string prefix = "local_usage_" + std::to_string(i + 1);
+            std::string host = src.GetString(prefix + "_host", "");
+            if (!host.empty()) {
+                dst.SetString(prefix + "_host", host);
+                dst.SetInt(prefix + "_port", src.GetInt(prefix + "_port", 3939));
+                std::string key = src.GetString(prefix + "_key", "");
+                if (!key.empty()) {
+                    dst.SetString(prefix + "_key", key);
+                }
+            }
+        }
+        const char* string_keys[] = {"usage_proxy_type", "usage_proxy_host", "usage_proxy_user",
+                                     "usage_proxy_pass"};
+        for (const char* key : string_keys) {
+            std::string value = src.GetString(key, "");
+            if (!value.empty()) {
+                dst.SetString(key, value);
+            }
+        }
+        const char* int_keys[] = {"codex_auth_count",    "zhipu_key_count",   "usage_proxy_port",
+                                  "usage_chatgpt_proxy", "usage_zhipu_proxy", "usage_refresh_minutes",
+                                  "local_usage_count"};
+        for (const char* key : int_keys) {
+            int32_t value = src.GetInt(key, -1);
+            if (value >= 0) {
+                dst.SetInt(key, value);
+            }
+        }
+        dst.SetInt("vendor_migrated", 1);
+        ESP_LOGI(TAG, "vendor settings migrated to nvs_vendor partition");
+    }
+
     // Q 键查询结果的全屏用量面板（LVGL，用时创建、关闭即删除）
     lv_obj_t* usage_panel_ = nullptr;
     esp_timer_handle_t usage_panel_timer_ = nullptr;
@@ -118,7 +188,7 @@ private:
 
     std::vector<std::string> LoadDirectAuthJsons() {
         std::vector<std::string> jsons;
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         int count = settings.GetInt("codex_auth_count", 0);
         for (int i = 0; i < count && i < 8; i++) {
             std::string json = settings.GetString(CodexAuthKey(i), "");
@@ -130,7 +200,7 @@ private:
     }
 
     void SaveDirectAuthJsons(const std::vector<std::string>& jsons) {
-        Settings settings("vendor", true);
+        Settings settings("vendor", true, VendorPartition());
         int old_count = settings.GetInt("codex_auth_count", 0);
         for (int i = (int)jsons.size(); i < old_count; i++) {
             settings.EraseKey(CodexAuthKey(i));
@@ -148,7 +218,7 @@ private:
 
     std::vector<std::string> LoadZhipuKeys() {
         std::vector<std::string> keys;
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         int count = settings.GetInt("zhipu_key_count", 0);
         for (int i = 0; i < count && i < 4; i++) {
             std::string key = settings.GetString(ZhipuKeyKey(i), "");
@@ -160,7 +230,7 @@ private:
     }
 
     void SaveZhipuKeys(const std::vector<std::string>& keys) {
-        Settings settings("vendor", true);
+        Settings settings("vendor", true, VendorPartition());
         int old_count = settings.GetInt("zhipu_key_count", 0);
         for (int i = (int)keys.size(); i < old_count; i++) {
             settings.EraseKey(ZhipuKeyKey(i));
@@ -172,7 +242,7 @@ private:
     }
 
     int GetUsageRefreshMinutes() {
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         return settings.GetInt("usage_refresh_minutes", 0);
     }
 
@@ -183,7 +253,7 @@ private:
 
     std::vector<LocalUsageConfig> LoadLocalUsages() {
         std::vector<LocalUsageConfig> out;
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         int count = settings.GetInt("local_usage_count", 0);
         for (int i = 0; i < count && i < 4; i++) {
             LocalUsageConfig cfg;
@@ -216,7 +286,7 @@ private:
     }
 
     void SaveLocalUsages(const std::vector<LocalUsageConfig>& configs) {
-        Settings settings("vendor", true);
+        Settings settings("vendor", true, VendorPartition());
         int old_count = settings.GetInt("local_usage_count", 0);
         for (int i = (int)configs.size(); i < old_count && i < 4; i++) {
             settings.EraseKey(LocalUsageKey(i, "host"));
@@ -243,7 +313,7 @@ private:
 
     Socks5Config GetSocks5Config() {
         Socks5Config proxy;
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         proxy.type = settings.GetString("usage_proxy_type", "socks5");
         proxy.host = settings.GetString("usage_proxy_host", "");
         proxy.port = settings.GetInt("usage_proxy_port", 0);
@@ -254,12 +324,12 @@ private:
 
     // 代理适用范围：ChatGPT 默认走代理（国内访问官方接口必需），智谱默认直连（国内站）
     bool ChatGptUseProxy() {
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         return settings.GetInt("usage_chatgpt_proxy", 1) != 0;
     }
 
     bool ZhipuUseProxy() {
-        Settings settings("vendor");
+        Settings settings("vendor", false, VendorPartition());
         return settings.GetInt("usage_zhipu_proxy", 0) != 0;
     }
 
@@ -635,7 +705,7 @@ private:
     }
 
     static esp_err_t UsageConfigClearProxyHandler(httpd_req_t* req) {
-        Settings settings("vendor", true);
+        Settings settings("vendor", true, VendorPartition());
         settings.SetString("usage_proxy_type", "socks5");
         settings.EraseKey("usage_proxy_host");
         settings.EraseKey("usage_proxy_port");
@@ -878,7 +948,7 @@ private:
         auto chatgpt_proxy = GetFormField(body, "chatgpt_proxy");
         auto zhipu_proxy = GetFormField(body, "zhipu_proxy");
 
-        Settings settings("vendor", true);
+        Settings settings("vendor", true, VendorPartition());
         if (!proxy_type.empty()) {
             settings.SetString("usage_proxy_type", proxy_type == "http" ? "http" : "socks5");
         }
@@ -1120,7 +1190,7 @@ private:
                 auto [new_token, updated_json] = usage::RefreshCodexToken(jsons[i], chatgpt_proxy);
                 if (!new_token.empty()) {
                     jsons[i] = updated_json;
-                    Settings settings("vendor", true);
+                    Settings settings("vendor", true, VendorPartition());
                     settings.SetString(CodexAuthKey((int)i), updated_json);
                     status = usage::DirectFetchUsage(new_token, acc.account_id, acc, chatgpt_proxy);
                     if (status == 200) {
@@ -2383,6 +2453,7 @@ private:
 
 public:
     atk_dnesp32s3_box2_wifi()  {
+        InitializeVendorNvs();
         InitializeI2c();
         InitializeIoExpander();
         InitializePowerSaveTimer();
@@ -2446,3 +2517,4 @@ DECLARE_BOARD(atk_dnesp32s3_box2_wifi);
 
 // 定义静态成员变量
 atk_dnesp32s3_box2_wifi* atk_dnesp32s3_box2_wifi::instance_ = nullptr;
+bool atk_dnesp32s3_box2_wifi::vendor_partition_ok_ = false;

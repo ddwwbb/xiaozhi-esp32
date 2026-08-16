@@ -5,8 +5,15 @@
 
 #define TAG "Settings"
 
-Settings::Settings(const std::string& ns, bool read_write) : ns_(ns), read_write_(read_write) {
-    nvs_open(ns.c_str(), read_write_ ? NVS_READWRITE : NVS_READONLY, &nvs_handle_);
+Settings::Settings(const std::string& ns, bool read_write, const std::string& partition)
+    : ns_(ns), read_write_(read_write) {
+    // 打开失败保持 handle=0：读方法返回默认值，写方法记日志跳过（避免上层 abort）
+    esp_err_t err = nvs_open_from_partition(partition.c_str(), ns.c_str(),
+                                            read_write_ ? NVS_READWRITE : NVS_READONLY, &nvs_handle_);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open %s:%s failed: %s", partition.c_str(), ns.c_str(), esp_err_to_name(err));
+        nvs_handle_ = 0;
+    }
 }
 
 Settings::~Settings() {
@@ -38,6 +45,10 @@ std::string Settings::GetString(const std::string& key, const std::string& defau
 }
 
 void Settings::SetString(const std::string& key, const std::string& value) {
+    if (nvs_handle_ == 0) {
+        ESP_LOGE(TAG, "Namespace %s is not open, skip set %s", ns_.c_str(), key.c_str());
+        return;
+    }
     if (read_write_) {
         ESP_ERROR_CHECK(nvs_set_str(nvs_handle_, key.c_str(), value.c_str()));
         dirty_ = true;
@@ -59,6 +70,10 @@ int32_t Settings::GetInt(const std::string& key, int32_t default_value) {
 }
 
 void Settings::SetInt(const std::string& key, int32_t value) {
+    if (nvs_handle_ == 0) {
+        ESP_LOGE(TAG, "Namespace %s is not open, skip set %s", ns_.c_str(), key.c_str());
+        return;
+    }
     if (read_write_) {
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle_, key.c_str(), value));
         dirty_ = true;
@@ -80,6 +95,10 @@ bool Settings::GetBool(const std::string& key, bool default_value) {
 }
 
 void Settings::SetBool(const std::string& key, bool value) {
+    if (nvs_handle_ == 0) {
+        ESP_LOGE(TAG, "Namespace %s is not open, skip set %s", ns_.c_str(), key.c_str());
+        return;
+    }
     if (read_write_) {
         ESP_ERROR_CHECK(nvs_set_u8(nvs_handle_, key.c_str(), value ? 1 : 0));
         dirty_ = true;
