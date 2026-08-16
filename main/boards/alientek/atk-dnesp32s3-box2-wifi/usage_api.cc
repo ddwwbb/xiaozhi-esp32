@@ -596,6 +596,70 @@ void FillDetailFromIdToken(AccountDetail& acc, const std::string& id_token) {
     cJSON_Delete(payload);
 }
 
+std::string CompactCodexAuthJson(const std::string& auth_json) {
+    cJSON* root = cJSON_Parse(auth_json.c_str());
+    if (root == nullptr || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return "";
+    }
+    auto get_string = [root](const char* key) -> std::string {
+        cJSON* item = cJSON_GetObjectItem(root, key);
+        return cJSON_IsString(item) ? item->valuestring : "";
+    };
+
+    AccountDetail detail;
+    detail.email = get_string("email");
+    detail.account_id = get_string("account_id");
+    std::string stored_plan = get_string("plan");
+    std::string stored_subscription_until = get_string("subscription_until");
+    FillDetailFromIdToken(detail, get_string("id_token"));
+    if (detail.plan.empty()) {
+        detail.plan = std::move(stored_plan);
+    }
+    if (detail.subscription_until.empty()) {
+        detail.subscription_until = std::move(stored_subscription_until);
+    }
+
+    cJSON* compact = cJSON_CreateObject();
+    if (compact == nullptr) {
+        cJSON_Delete(root);
+        return "";
+    }
+    auto copy_string = [root, compact](const char* key) {
+        cJSON* item = cJSON_GetObjectItem(root, key);
+        if (cJSON_IsString(item) && item->valuestring[0] != '\0') {
+            cJSON_AddStringToObject(compact, key, item->valuestring);
+        }
+    };
+    // access/refresh 是查询与轮换所需的唯一大字段；id_token 仅用于提取下列展示信息。
+    copy_string("access_token");
+    copy_string("refresh_token");
+    copy_string("expired");
+    copy_string("last_refresh");
+    if (!detail.account_id.empty()) {
+        cJSON_AddStringToObject(compact, "account_id", detail.account_id.c_str());
+    }
+    if (!detail.email.empty()) {
+        cJSON_AddStringToObject(compact, "email", detail.email.c_str());
+    }
+    if (!detail.plan.empty()) {
+        cJSON_AddStringToObject(compact, "plan", detail.plan.c_str());
+    }
+    if (!detail.subscription_until.empty()) {
+        cJSON_AddStringToObject(compact, "subscription_until", detail.subscription_until.c_str());
+    }
+
+    char* printed = cJSON_PrintUnformatted(compact);
+    cJSON_Delete(compact);
+    cJSON_Delete(root);
+    if (printed == nullptr) {
+        return "";
+    }
+    std::string result(printed);
+    cJSON_free(printed);
+    return result;
+}
+
 // 直连官方接口 GET chatgpt.com/backend-api/wham/usage；返回 HTTP 状态码，200 时填充 acc
 int DirectFetchUsage(const std::string& access_token, const std::string& account_id,
                             AccountDetail& acc, const Socks5Config* proxy) {
@@ -930,7 +994,7 @@ int FetchLocalUsage(const std::string& host, int port, const std::string& key,
     return 200;
 }
 
-// OAuth 刷新（codex 官方端点）：在 auth_json 基础上轮换令牌与时间戳，
+// OAuth 刷新（codex 官方端点）：轮换令牌后压缩 auth_json，
 // 返回 {新 access_token, 更新并序列化后的 auth_json}；失败返回空串。NVS 回写由调用方完成
 std::pair<std::string, std::string> RefreshCodexToken(const std::string& auth_json,
                                                       const Socks5Config* proxy) {
@@ -973,12 +1037,16 @@ std::pair<std::string, std::string> RefreshCodexToken(const std::string& auth_js
         cJSON_Delete(root);
         return {};
     }
+    // token 随 cJSON_Delete(token) 释放，必须先复制，不能保留 valuestring 指针。
+    std::string access_token = access_item->valuestring;
 
-    // 轮换：access/refresh/id token 都可能更新，必须全部写回
+    // 轮换：access/refresh/id token 都可能更新，必须全部写回。紧凑格式没有 id_token，
+    // 所以不能只 Replace，字段不存在时也必须 Add，供后续提取最新展示信息。
     auto replace_string = [root](const char* key, cJSON* value_root) {
         cJSON* value = value_root ? cJSON_GetObjectItem(value_root, key) : nullptr;
         if (cJSON_IsString(value)) {
-            cJSON_ReplaceItemInObject(root, key, cJSON_CreateString(value->valuestring));
+            cJSON_DeleteItemFromObject(root, key);
+            cJSON_AddStringToObject(root, key, value->valuestring);
         }
     };
     replace_string("access_token", token);
@@ -988,23 +1056,27 @@ std::pair<std::string, std::string> RefreshCodexToken(const std::string& auth_js
     time_t now = time(nullptr);
     char time_str[24];
     strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
-    cJSON_ReplaceItemInObject(root, "last_refresh", cJSON_CreateString(time_str));
+    cJSON_DeleteItemFromObject(root, "last_refresh");
+    cJSON_AddStringToObject(root, "last_refresh", time_str);
     cJSON* expires_item = cJSON_GetObjectItem(token, "expires_in");
     if (cJSON_IsNumber(expires_item)) {
         time_t expired_at = now + expires_item->valueint;
         strftime(time_str, sizeof(time_str), "%Y-%m-%dT%H:%M:%SZ", gmtime(&expired_at));
-        cJSON_ReplaceItemInObject(root, "expired", cJSON_CreateString(time_str));
+        cJSON_DeleteItemFromObject(root, "expired");
+        cJSON_AddStringToObject(root, "expired", time_str);
     }
     cJSON_Delete(token);
 
-    std::string access_token = access_item->valuestring;
     char* printed = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (printed == nullptr) {
         return {};
     }
-    std::string updated(printed);
+    std::string updated = CompactCodexAuthJson(printed);
     cJSON_free(printed);
+    if (updated.empty()) {
+        return {};
+    }
     ESP_LOGI(TAG, "Token refreshed");
     return {access_token, updated};
 }

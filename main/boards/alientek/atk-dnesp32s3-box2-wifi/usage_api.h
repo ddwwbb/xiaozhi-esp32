@@ -86,6 +86,9 @@ bool PlainHttpGet(const std::string& host, int port, const std::string& path,
 // ---------- JWT / 账号工具 ----------
 std::string ExtractAccountId(const std::string& auth_json);
 void FillDetailFromIdToken(AccountDetail& acc, const std::string& id_token);
+// 只保留查询、刷新与展示所需字段，并把 id_token 中的展示信息提取到顶层，
+// 避免两个长 JWT 同时写入 NVS 单值而超过约 4KB 的限制。
+std::string CompactCodexAuthJson(const std::string& auth_json);
 
 // ---------- 数据源适配（返回 200 成功；HTTP 状态码原样；-1 网络；-2 解析/业务失败） ----------
 int DirectFetchUsage(const std::string& access_token, const std::string& account_id,
@@ -97,7 +100,7 @@ int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc, const Socks5
 int FetchLocalUsage(const std::string& host, int port, const std::string& key,
                     const std::string& name_suffix, std::vector<AccountDetail>& locals);
 
-// OAuth 刷新（codex 官方端点）：在完整 auth_json 基础上轮换令牌与时间戳，
+// OAuth 刷新（codex 官方端点）：轮换令牌并返回紧凑 auth_json，
 // 返回 {新 access_token, 更新并序列化后的 auth_json}，NVS 回写由调用方完成
 std::pair<std::string, std::string> RefreshCodexToken(const std::string& auth_json,
                                                       const Socks5Config* proxy);

@@ -513,7 +513,8 @@ private:
 
                 "<h3>智谱 AI 令牌（官方 API Key）</h3>"
                 "<p><small>粘贴智谱开放平台（open.bigmodel.cn）的 API Key，"
-                "查询 GLM 套餐 token 用量（5 小时/每周窗口）。最多 4 个。</small></p>";
+                "查询 GLM 套餐 token 用量（5 小时/每周窗口）。不能使用上方的 Codex auth.json；"
+                "最多 4 个。</small></p>";
 
         auto zhipu_keys = instance_->LoadZhipuKeys();
         for (size_t i = 0; i < zhipu_keys.size(); i++) {
@@ -603,11 +604,11 @@ private:
     }
 
 
-    // NVS 分区（默认 "nvs"，16KB）剩余空间是否够写 length 字节的字符串值。
+    // 当前 vendor NVS 分区剩余空间是否够写 length 字节的字符串值。
     // 空间不足时 Settings::SetString 内部的 ESP_ERROR_CHECK 会直接 abort 重启，必须预检
     static bool NvsHasSpaceFor(size_t length) {
         nvs_stats_t stats = {};
-        if (nvs_get_stats("nvs", &stats) != ESP_OK) {
+        if (nvs_get_stats(VendorPartition(), &stats) != ESP_OK) {
             return true;  // 统计失败不阻塞正常路径
         }
         size_t need_entries = (length + 31) / 32 + 2;      // 值 entry + key 开销
@@ -654,12 +655,8 @@ private:
             SendSimplePage(req, "<h3>导入失败：无法确定 account_id</h3>", "返回");
             return ESP_OK;
         }
-        cJSON* account_item = cJSON_GetObjectItem(root, "account_id");
-        if (cJSON_IsString(account_item)) {
-            cJSON_ReplaceItemInObject(root, "account_id", cJSON_CreateString(account_id.c_str()));
-        } else {
-            cJSON_AddStringToObject(root, "account_id", account_id.c_str());
-        }
+        cJSON_DeleteItemFromObject(root, "account_id");
+        cJSON_AddStringToObject(root, "account_id", account_id.c_str());
 
         auto jsons = instance_->LoadDirectAuthJsons();
         int replace_index = -1;
@@ -681,23 +678,27 @@ private:
             SendSimplePage(req, "<h3>导入失败：序列化错误</h3>", "返回");
             return ESP_OK;
         }
-        // NVS 单值受一页（4KB）容量限制，且分区总空间仅 16KB；
+        // auth.json 常同时带两个长 JWT；id_token 只用于展示元数据，先提取再丢弃，
+        // 避免原样写入触发 NVS 单字符串约 4KB 的上限。
+        std::string compact_json = usage::CompactCodexAuthJson(printed);
+        cJSON_free(printed);
+        cJSON_Delete(root);
+        if (compact_json.empty()) {
+            SendSimplePage(req, "<h3>导入失败：令牌整理失败</h3>", "返回");
+            return ESP_OK;
+        }
         // 超限或空间不足时不写入（SetString 失败会 abort 重启）
-        size_t printed_len = strlen(printed);
+        size_t printed_len = compact_json.size();
         if (printed_len > 3600 || !NvsHasSpaceFor(printed_len)) {
-            cJSON_free(printed);
-            cJSON_Delete(root);
             SendSimplePage(req, "<h3>导入失败：令牌过大或设备存储空间不足，"
                                 "可删除不用的账号后重试</h3>", "返回");
             return ESP_OK;
         }
         if (replace_index >= 0) {
-            jsons[replace_index] = printed;
+            jsons[replace_index] = compact_json;
         } else {
-            jsons.push_back(printed);
+            jsons.push_back(std::move(compact_json));
         }
-        cJSON_free(printed);
-        cJSON_Delete(root);
         instance_->SaveDirectAuthJsons(jsons);
 
         SendSimplePage(req, "<h3>已导入，当前共 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
@@ -743,7 +744,11 @@ private:
         if (key.size() < 20 || key.size() > 128) {
             return false;
         }
-        for (char c : key) {
+        size_t dot = key.find('.');
+        if (dot == std::string::npos || dot == 0 || dot + 1 == key.size()) {
+            return false;
+        }
+        for (unsigned char c : key) {
             if (c <= 0x20 || c >= 0x7F) {
                 return false;
             }
@@ -812,26 +817,45 @@ private:
         std::string key = GetFormField(std::string(body, received), "zhipu_key");
         TrimSpaces(key);
 
-        cJSON* root = cJSON_Parse(key.c_str());
-        if (root != nullptr) {
+        // 纯文本 Key 常以数字开头。cJSON_Parse("123.xxx") 会只消费数字前缀并返回成功，
+        // 因此仅对明显的 JSON 输入做严格（必须消费完整字符串）解析。
+        cJSON* root = nullptr;
+        if (!key.empty() && (key.front() == '{' || key.front() == '"')) {
+            root = cJSON_ParseWithOpts(key.c_str(), nullptr, true);
+            if (root == nullptr) {
+                SendSimplePage(req, "<h3>导入失败：不是有效的智谱 API Key（形如 xxxxxxxxxx.xxxxxxxx）</h3>", "返回");
+                return ESP_OK;
+            }
             // 容错：直接粘贴了 {"api_key":"..."} 之类的 JSON 时取字符串字段
             const char* fields[] = {"api_key", "apiKey", "key", "token"};
             std::string extracted;
-            for (const char* field : fields) {
-                cJSON* item = cJSON_GetObjectItem(root, field);
-                if (cJSON_IsString(item)) {
-                    extracted = item->valuestring;
-                    break;
+            if (cJSON_IsString(root)) {
+                extracted = root->valuestring;
+            } else if (cJSON_IsObject(root)) {
+                for (const char* field : fields) {
+                    cJSON* item = cJSON_GetObjectItem(root, field);
+                    if (cJSON_IsString(item)) {
+                        extracted = item->valuestring;
+                        break;
+                    }
                 }
             }
+            bool is_codex_auth = cJSON_IsObject(root) &&
+                                 (cJSON_GetObjectItem(root, "access_token") != nullptr ||
+                                  cJSON_GetObjectItem(root, "refresh_token") != nullptr);
             cJSON_Delete(root);
             // 可解析为 JSON 却不含已知令牌字段：粘贴的是错误内容，整体判无效，
             // 防止 JSON 文本本身恰好通过 ValidZhipuKey 被存入 NVS
             if (extracted.empty()) {
+                if (is_codex_auth) {
+                    SendSimplePage(req, "<h3>导入失败：这是 Codex/OpenAI 账号令牌，请粘贴到“直连账号”输入框</h3>", "返回");
+                    return ESP_OK;
+                }
                 SendSimplePage(req, "<h3>导入失败：不是有效的智谱 API Key（形如 xxxxxxxxxx.xxxxxxxx）</h3>", "返回");
                 return ESP_OK;
             }
             key = extracted;
+            TrimSpaces(key);
         }
 
         if (!ValidZhipuKey(key)) {
@@ -1192,6 +1216,8 @@ private:
             AccountDetail acc;
             acc.email = get_str("email");
             acc.account_id = get_str("account_id");
+            acc.plan = get_str("plan");
+            acc.subscription_until = get_str("subscription_until");
             usage::FillDetailFromIdToken(acc, get_str("id_token"));
             std::string last_refresh = get_str("last_refresh");
             if (last_refresh.size() > 5) {
