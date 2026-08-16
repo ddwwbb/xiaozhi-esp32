@@ -182,6 +182,8 @@ private:
     time_t usage_updated_at_ = 0;
 
     // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 codex auth.json 格式
+    static constexpr int kMaxDirectAccounts = 4;
+
     static std::string CodexAuthKey(int index) {
         return "codex_auth_" + std::to_string(index + 1);
     }
@@ -190,7 +192,7 @@ private:
         std::vector<std::string> jsons;
         Settings settings("vendor", false, VendorPartition());
         int count = settings.GetInt("codex_auth_count", 0);
-        for (int i = 0; i < count && i < 8; i++) {
+        for (int i = 0; i < count && i < kMaxDirectAccounts; i++) {
             std::string json = settings.GetString(CodexAuthKey(i), "");
             if (!json.empty()) {
                 jsons.push_back(std::move(json));
@@ -199,16 +201,65 @@ private:
         return jsons;
     }
 
-    void SaveDirectAuthJsons(const std::vector<std::string>& jsons) {
-        Settings settings("vendor", true, VendorPartition());
-        int old_count = settings.GetInt("codex_auth_count", 0);
+    // 账号令牌属于不可信的大输入，不能走 Settings::SetString 的 ESP_ERROR_CHECK 路径；
+    // 任一 NVS 错误都返回给网页，绝不能让设备 abort 重启。
+    static bool SaveDirectAuthJsons(const std::vector<std::string>& jsons) {
+        if (jsons.size() > kMaxDirectAccounts) {
+            return false;
+        }
+        nvs_handle_t handle = 0;
+        esp_err_t err = nvs_open_from_partition(VendorPartition(), "vendor", NVS_READWRITE, &handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Open token storage failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        int32_t old_count = 0;
+        err = nvs_get_i32(handle, "codex_auth_count", &old_count);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            old_count = 0;
+            err = ESP_OK;
+        }
         for (int i = (int)jsons.size(); i < old_count; i++) {
-            settings.EraseKey(CodexAuthKey(i));
+            esp_err_t erase_err = nvs_erase_key(handle, CodexAuthKey(i).c_str());
+            if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+                err = erase_err;
+                break;
+            }
         }
-        for (size_t i = 0; i < jsons.size(); i++) {
-            settings.SetString(CodexAuthKey((int)i), jsons[i]);
+        for (size_t i = 0; err == ESP_OK && i < jsons.size(); i++) {
+            err = nvs_set_str(handle, CodexAuthKey((int)i).c_str(), jsons[i].c_str());
         }
-        settings.SetInt("codex_auth_count", (int)jsons.size());
+        if (err == ESP_OK) {
+            err = nvs_set_i32(handle, "codex_auth_count", (int32_t)jsons.size());
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+        nvs_close(handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Save token storage failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        return true;
+    }
+
+    static bool SaveDirectAuthJson(int index, const std::string& json) {
+        nvs_handle_t handle = 0;
+        esp_err_t err = nvs_open_from_partition(VendorPartition(), "vendor", NVS_READWRITE, &handle);
+        if (err == ESP_OK) {
+            err = nvs_set_str(handle, CodexAuthKey(index).c_str(), json.c_str());
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+        }
+        if (handle != 0) {
+            nvs_close(handle);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Update token storage failed: %s", esp_err_to_name(err));
+            return false;
+        }
+        return true;
     }
 
     // 智谱官方 API Key（NVS，vendor 命名空间），最多 4 个
@@ -508,7 +559,7 @@ private:
         page += "<form method=\"POST\" action=\"/import\">"
                 "<textarea name=\"auth_json\" rows=\"5\" style=\"width:100%\" "
                 "placeholder=\"粘贴 Codex 令牌文件内容（auth.json，需含 refresh_token）\"></textarea>"
-                "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 8 个</small></p>"
+                "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 4 个</small></p>"
                 "</form>"
 
                 "<h3>智谱 AI 令牌（官方 API Key）</h3>"
@@ -609,7 +660,7 @@ private:
     static bool NvsHasSpaceFor(size_t length) {
         nvs_stats_t stats = {};
         if (nvs_get_stats(VendorPartition(), &stats) != ESP_OK) {
-            return true;  // 统计失败不阻塞正常路径
+            return false;  // 无法确认容量时拒绝写入，避免走到 NVS 错误路径
         }
         size_t need_entries = (length + 31) / 32 + 2;      // 值 entry + key 开销
         return stats.free_entries > need_entries + 8;      // 余量防页内碎片
@@ -666,9 +717,9 @@ private:
                 break;
             }
         }
-        if (replace_index < 0 && jsons.size() >= 8) {
+        if (replace_index < 0 && jsons.size() >= kMaxDirectAccounts) {
             cJSON_Delete(root);
-            SendSimplePage(req, "<h3>导入失败：最多 8 个账号</h3>", "返回");
+            SendSimplePage(req, "<h3>导入失败：最多 4 个账号</h3>", "返回");
             return ESP_OK;
         }
 
@@ -699,7 +750,10 @@ private:
         } else {
             jsons.push_back(std::move(compact_json));
         }
-        instance_->SaveDirectAuthJsons(jsons);
+        if (!instance_->SaveDirectAuthJsons(jsons)) {
+            SendSimplePage(req, "<h3>导入失败：设备存储写入失败，请完整烧录新版分区表后重试</h3>", "返回");
+            return ESP_OK;
+        }
 
         SendSimplePage(req, "<h3>已导入，当前共 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
         return ESP_OK;
@@ -734,7 +788,10 @@ private:
             return ESP_OK;
         }
         jsons.erase(jsons.begin() + index);
-        instance_->SaveDirectAuthJsons(jsons);
+        if (!instance_->SaveDirectAuthJsons(jsons)) {
+            SendSimplePage(req, "<h3>删除失败：设备存储写入失败</h3>", "返回");
+            return ESP_OK;
+        }
         SendSimplePage(req, "<h3>已删除，剩余 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
         return ESP_OK;
     }
@@ -1246,8 +1303,10 @@ private:
                 auto [new_token, updated_json] = usage::RefreshCodexToken(jsons[i], chatgpt_proxy);
                 if (!new_token.empty()) {
                     jsons[i] = updated_json;
-                    Settings settings("vendor", true, VendorPartition());
-                    settings.SetString(CodexAuthKey((int)i), updated_json);
+                    if (!SaveDirectAuthJson((int)i, updated_json)) {
+                        ESP_LOGE(TAG, "Refreshed token could not be persisted for account %u",
+                                 (unsigned)i);
+                    }
                     status = usage::DirectFetchUsage(new_token, acc.account_id, acc, chatgpt_proxy);
                     if (status == 200) {
                         final_token = new_token;
