@@ -815,8 +815,8 @@ int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc, const Socks5
 }
 
 // 本机统计服务（PC 端 box2-usage-server，明文 HTTP）GET /usage。
-// 服务端聚合 Claude Code 与 Codex CLI 的本地会话记录：当天/本周 token 与费用、
-    // 近 14 天逐日、累计/峰值/连续天数、按模型分类。
+// 服务端聚合 Claude Code / ZCode / Codex CLI 的本地会话记录：当天/本周 token 与费用、
+// 近 14 天逐日、累计/峰值/连续天数、按模型分类。
     // 成功时 locals 追加三张维度卡片（当天/本周/累计），各对应一个详情页；
 // 失败时追加一个 unavailable 条目。返回 200 成功；HTTP 状态码；-1 网络；-2 解析失败
 int FetchLocalUsage(const std::string& host, int port, const std::string& key,
