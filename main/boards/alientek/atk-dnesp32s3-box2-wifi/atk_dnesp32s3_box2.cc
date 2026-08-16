@@ -86,6 +86,18 @@ private:
     // vendor 数据存板专属 64KB NVS 分区（partitions/v2/16m.csv 的 nvs_vendor）；
     // 旧固件分区表无此分区时回落默认 "nvs"（容量小，导入大令牌受限但不崩溃）
     static bool vendor_partition_ok_;
+    // ESP-IDF NVS key 最长 15 字符，配置键必须全部保持在该限制内。
+    static constexpr const char* kCodexCountKey = "codex_count";
+    static constexpr const char* kLocalCountKey = "local_count";
+    static constexpr const char* kRefreshMinutesKey = "refresh_min";
+    static constexpr const char* kProxyTypeKey = "proxy_type";
+    static constexpr const char* kProxyHostKey = "proxy_host";
+    static constexpr const char* kProxyPortKey = "proxy_port";
+    static constexpr const char* kProxyUserKey = "proxy_user";
+    static constexpr const char* kProxyPassKey = "proxy_pass";
+    static constexpr const char* kChatGptProxyKey = "proxy_chatgpt";
+    static constexpr const char* kZhipuProxyKey = "proxy_zhipu";
+
     static const char* VendorPartition() {
         return vendor_partition_ok_ ? "nvs_vendor" : "nvs";
     }
@@ -121,7 +133,7 @@ private:
             }
         }
         for (int i = 0; i < 4; i++) {
-            std::string prefix = "local_usage_" + std::to_string(i + 1);
+            std::string prefix = "local_" + std::to_string(i + 1);
             std::string host = src.GetString(prefix + "_host", "");
             if (!host.empty()) {
                 dst.SetString(prefix + "_host", host);
@@ -132,17 +144,16 @@ private:
                 }
             }
         }
-        const char* string_keys[] = {"usage_proxy_type", "usage_proxy_host", "usage_proxy_user",
-                                     "usage_proxy_pass"};
+        const char* string_keys[] = {kProxyTypeKey, kProxyHostKey, kProxyUserKey, kProxyPassKey};
         for (const char* key : string_keys) {
             std::string value = src.GetString(key, "");
             if (!value.empty()) {
                 dst.SetString(key, value);
             }
         }
-        const char* int_keys[] = {"codex_auth_count",    "zhipu_key_count",   "usage_proxy_port",
-                                  "usage_chatgpt_proxy", "usage_zhipu_proxy", "usage_refresh_minutes",
-                                  "local_usage_count"};
+        const char* int_keys[] = {kCodexCountKey, kLocalCountKey, kRefreshMinutesKey,
+                                  kProxyPortKey, kChatGptProxyKey, kZhipuProxyKey,
+                                  "zhipu_key_count"};
         for (const char* key : int_keys) {
             int32_t value = src.GetInt(key, -1);
             if (value >= 0) {
@@ -191,7 +202,7 @@ private:
     std::vector<std::string> LoadDirectAuthJsons() {
         std::vector<std::string> jsons;
         Settings settings("vendor", false, VendorPartition());
-        int count = settings.GetInt("codex_auth_count", 0);
+        int count = settings.GetInt(kCodexCountKey, 0);
         for (int i = 0; i < count && i < kMaxDirectAccounts; i++) {
             std::string json = settings.GetString(CodexAuthKey(i), "");
             if (!json.empty()) {
@@ -214,7 +225,7 @@ private:
             return false;
         }
         int32_t old_count = 0;
-        err = nvs_get_i32(handle, "codex_auth_count", &old_count);
+        err = nvs_get_i32(handle, kCodexCountKey, &old_count);
         if (err == ESP_ERR_NVS_NOT_FOUND) {
             old_count = 0;
             err = ESP_OK;
@@ -230,7 +241,7 @@ private:
             err = nvs_set_str(handle, CodexAuthKey((int)i).c_str(), jsons[i].c_str());
         }
         if (err == ESP_OK) {
-            err = nvs_set_i32(handle, "codex_auth_count", (int32_t)jsons.size());
+            err = nvs_set_i32(handle, kCodexCountKey, (int32_t)jsons.size());
         }
         if (err == ESP_OK) {
             err = nvs_commit(handle);
@@ -294,18 +305,18 @@ private:
 
     int GetUsageRefreshMinutes() {
         Settings settings("vendor", false, VendorPartition());
-        return settings.GetInt("usage_refresh_minutes", 0);
+        return settings.GetInt(kRefreshMinutesKey, 0);
     }
 
     // 本机统计服务（PC 端 box2-usage-server）地址，最多 4 台
     static std::string LocalUsageKey(int index, const char* field) {
-        return "local_usage_" + std::to_string(index + 1) + "_" + field;
+        return "local_" + std::to_string(index + 1) + "_" + field;
     }
 
     std::vector<LocalUsageConfig> LoadLocalUsages() {
         std::vector<LocalUsageConfig> out;
         Settings settings("vendor", false, VendorPartition());
-        int count = settings.GetInt("local_usage_count", 0);
+        int count = settings.GetInt(kLocalCountKey, 0);
         for (int i = 0; i < count && i < 4; i++) {
             LocalUsageConfig cfg;
             cfg.host = settings.GetString(LocalUsageKey(i, "host"), "");
@@ -319,26 +330,12 @@ private:
             cfg.key = settings.GetString(LocalUsageKey(i, "key"), "");
             out.push_back(std::move(cfg));
         }
-        if (out.empty()) {
-            // 迁移旧版单地址配置（local_usage_host）为第 1 条
-            std::string legacy = settings.GetString("local_usage_host", "");
-            if (!legacy.empty()) {
-                LocalUsageConfig cfg;
-                cfg.host = legacy;
-                cfg.port = settings.GetInt("local_usage_port", 3939);
-                if (cfg.port <= 0 || cfg.port >= 65536) {
-                    cfg.port = 3939;
-                }
-                cfg.key = settings.GetString("local_usage_key", "");
-                out.push_back(std::move(cfg));
-            }
-        }
         return out;
     }
 
     void SaveLocalUsages(const std::vector<LocalUsageConfig>& configs) {
         Settings settings("vendor", true, VendorPartition());
-        int old_count = settings.GetInt("local_usage_count", 0);
+        int old_count = settings.GetInt(kLocalCountKey, 0);
         for (int i = (int)configs.size(); i < old_count && i < 4; i++) {
             settings.EraseKey(LocalUsageKey(i, "host"));
             settings.EraseKey(LocalUsageKey(i, "port"));
@@ -353,11 +350,7 @@ private:
                 settings.EraseKey(LocalUsageKey((int)i, "key"));
             }
         }
-        settings.SetInt("local_usage_count", (int)configs.size());
-        // 旧版单地址键不再使用
-        settings.EraseKey("local_usage_host");
-        settings.EraseKey("local_usage_port");
-        settings.EraseKey("local_usage_key");
+        settings.SetInt(kLocalCountKey, (int)configs.size());
     }
 
     // 直连模式可选代理（socks5 或 http CONNECT，均支持账号密码认证）
@@ -365,23 +358,23 @@ private:
     Socks5Config GetSocks5Config() {
         Socks5Config proxy;
         Settings settings("vendor", false, VendorPartition());
-        proxy.type = settings.GetString("usage_proxy_type", "socks5");
-        proxy.host = settings.GetString("usage_proxy_host", "");
-        proxy.port = settings.GetInt("usage_proxy_port", 0);
-        proxy.user = settings.GetString("usage_proxy_user", "");
-        proxy.pass = settings.GetString("usage_proxy_pass", "");
+        proxy.type = settings.GetString(kProxyTypeKey, "socks5");
+        proxy.host = settings.GetString(kProxyHostKey, "");
+        proxy.port = settings.GetInt(kProxyPortKey, 0);
+        proxy.user = settings.GetString(kProxyUserKey, "");
+        proxy.pass = settings.GetString(kProxyPassKey, "");
         return proxy;
     }
 
     // 代理适用范围：ChatGPT 默认走代理（国内访问官方接口必需），智谱默认直连（国内站）
     bool ChatGptUseProxy() {
         Settings settings("vendor", false, VendorPartition());
-        return settings.GetInt("usage_chatgpt_proxy", 1) != 0;
+        return settings.GetInt(kChatGptProxyKey, 1) != 0;
     }
 
     bool ZhipuUseProxy() {
         Settings settings("vendor", false, VendorPartition());
-        return settings.GetInt("usage_zhipu_proxy", 0) != 0;
+        return settings.GetInt(kZhipuProxyKey, 0) != 0;
     }
 
     void InitializeBoardPowerManager() {
@@ -532,7 +525,7 @@ private:
             "<title>用量查询配置</title></head>"
             "<body style=\"font-family:sans-serif;max-width:520px;margin:24px auto\">"
             "<h2>AI 用量查询配置（官方接口直连）</h2>"
-            "<h3>直连账号</h3>";
+            "<h3>ChatGPT 令牌</h3>";
 
         auto jsons = instance_->LoadDirectAuthJsons();
         if (jsons.empty()) {
@@ -761,14 +754,14 @@ private:
 
     static esp_err_t UsageConfigClearProxyHandler(httpd_req_t* req) {
         Settings settings("vendor", true, VendorPartition());
-        settings.SetString("usage_proxy_type", "socks5");
-        settings.EraseKey("usage_proxy_host");
-        settings.EraseKey("usage_proxy_port");
-        settings.EraseKey("usage_proxy_user");
-        settings.EraseKey("usage_proxy_pass");
+        settings.SetString(kProxyTypeKey, "socks5");
+        settings.EraseKey(kProxyHostKey);
+        settings.EraseKey(kProxyPortKey);
+        settings.EraseKey(kProxyUserKey);
+        settings.EraseKey(kProxyPassKey);
         // 范围一并回到默认：ChatGPT 走代理、智谱直连
-        settings.SetInt("usage_chatgpt_proxy", 1);
-        settings.SetInt("usage_zhipu_proxy", 0);
+        settings.SetInt(kChatGptProxyKey, 1);
+        settings.SetInt(kZhipuProxyKey, 0);
         SendSimplePage(req, "<h3>已清除代理设置</h3>", "返回");
         return ESP_OK;
     }
@@ -905,7 +898,7 @@ private:
             // 防止 JSON 文本本身恰好通过 ValidZhipuKey 被存入 NVS
             if (extracted.empty()) {
                 if (is_codex_auth) {
-                    SendSimplePage(req, "<h3>导入失败：这是 Codex/OpenAI 账号令牌，请粘贴到“直连账号”输入框</h3>", "返回");
+                    SendSimplePage(req, "<h3>导入失败：这是 Codex/OpenAI 账号令牌，请粘贴到“ChatGPT 令牌”输入框</h3>", "返回");
                     return ESP_OK;
                 }
                 SendSimplePage(req, "<h3>导入失败：不是有效的智谱 API Key（形如 xxxxxxxxxx.xxxxxxxx）</h3>", "返回");
@@ -1061,34 +1054,34 @@ private:
 
         Settings settings("vendor", true, VendorPartition());
         if (!proxy_type.empty()) {
-            settings.SetString("usage_proxy_type", proxy_type == "http" ? "http" : "socks5");
+            settings.SetString(kProxyTypeKey, proxy_type == "http" ? "http" : "socks5");
         }
         if (!chatgpt_proxy.empty()) {
-            settings.SetInt("usage_chatgpt_proxy", atoi(chatgpt_proxy.c_str()) != 0 ? 1 : 0);
+            settings.SetInt(kChatGptProxyKey, atoi(chatgpt_proxy.c_str()) != 0 ? 1 : 0);
         }
         if (!zhipu_proxy.empty()) {
-            settings.SetInt("usage_zhipu_proxy", atoi(zhipu_proxy.c_str()) != 0 ? 1 : 0);
+            settings.SetInt(kZhipuProxyKey, atoi(zhipu_proxy.c_str()) != 0 ? 1 : 0);
         }
         if (!proxy_host.empty()) {
-            settings.SetString("usage_proxy_host", proxy_host);
+            settings.SetString(kProxyHostKey, proxy_host);
         }
         if (!proxy_port.empty()) {
             int port = atoi(proxy_port.c_str());
             if (port > 0 && port < 65536) {
-                settings.SetInt("usage_proxy_port", port);
+                settings.SetInt(kProxyPortKey, port);
             }
         }
         if (!proxy_user.empty()) {
-            settings.SetString("usage_proxy_user", proxy_user);
+            settings.SetString(kProxyUserKey, proxy_user);
         }
         if (!proxy_pass.empty()) {
-            settings.SetString("usage_proxy_pass", proxy_pass);
+            settings.SetString(kProxyPassKey, proxy_pass);
         }
         if (!refresh_minutes.empty()) {
             int minutes = atoi(refresh_minutes.c_str());
             if (minutes < 0) minutes = 0;
             if (minutes > 1440) minutes = 1440;
-            settings.SetInt("usage_refresh_minutes", minutes);
+            settings.SetInt(kRefreshMinutesKey, minutes);
         }
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
