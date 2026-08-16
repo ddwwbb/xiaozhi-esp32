@@ -50,14 +50,15 @@ struct AccountDetail {
     int reset_cr = -1;
     std::string account_id;  // 查询时需要
     // ---- 本机统计（PC 端 box2-usage-server），无官方配额概念 ----
-    bool local_stats = false;      // 当天/本周/累计 维度卡片与官方账号的语义分派
+    // 每台 PC 一个条目携带全量数据：列表一页两台（卡片三行），详情一页一台
+    bool local_stats = false;      // 本机条目与官方账号的语义分派
     long long today_tokens = -1;
     long long week_tokens = -1;
     double today_cost = -1;
     double week_cost = -1;
     double lifetime_cost = -1;
-    int requests = -1;          // 当天/本周条目的请求数
-    std::string stat_line;      // 卡片数值行文本（空=隐藏，官方账号无此数据）
+    int requests = -1;          // 当天请求数
+    int week_requests = -1;     // 本周请求数
     struct ModelStat {
         std::string name;
         long long tokens;
@@ -92,7 +93,7 @@ int DirectFetchUsage(const std::string& access_token, const std::string& account
 void FetchOfficialExtras(const std::string& access_token, const std::string& account_id,
                          AccountDetail& acc, const Socks5Config* proxy);
 int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc, const Socks5Config* proxy);
-// 本机统计：成功时 locals 追加 当天/本周/累计 三张维度卡片；name_suffix 用于多 PC 区分
+// 本机统计：成功时 locals 每台 PC 追加一个携带全量数据的条目；name_suffix 用于多 PC 区分
 int FetchLocalUsage(const std::string& host, int port, const std::string& key,
                     const std::string& name_suffix, std::vector<AccountDetail>& locals);
 

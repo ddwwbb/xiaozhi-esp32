@@ -104,6 +104,7 @@ private:
     esp_timer_handle_t usage_loading_timer_ = nullptr;
     lv_obj_t* loading_label_ = nullptr;
     int loading_dots_ = 0;
+    time_t usage_query_started_at_ = 0;  // 本次查询起点，用于详情页显示下次刷新倒计时
     // 自动刷新后恢复位置（源 + 详情索引，-1=列表页）
     int pending_restore_source_ = -1;
     int pending_detail_restore_ = -1;
@@ -1162,6 +1163,7 @@ private:
     }
 
     void QueryUsage() {
+        usage_query_started_at_ = time(nullptr);
         pending_restore_source_ = usage_source_;
         pending_detail_restore_ = CurrentDetailIndex();
         if (LoadDirectAuthJsons().empty() && LoadZhipuKeys().empty() && LoadLocalUsages().empty()) {
@@ -1542,22 +1544,41 @@ private:
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
-        // 数值行（token/费用/请求数）：stat_line 非空即显示，官方账号无此数据自动隐藏。
+        // 本机统计卡片：一张卡浓缩 当天/本周/累计 三行（一页两台 PC）。
         // 主字体：数值含 万/亿/· 单位，不在 14px 小字体的字符集里
-        if (!acc.stat_line.empty()) {
-            lv_obj_t* stat_label = lv_label_create(card);
-            lv_obj_set_width(stat_label, lv_pct(100));
-            lv_obj_set_height(stat_label, 20);
-            lv_label_set_long_mode(stat_label, LV_LABEL_LONG_DOT);
-            lv_obj_set_style_text_font(stat_label, PanelTextFont(), 0);
-            lv_obj_set_style_text_color(stat_label, lv_color_hex(0xE8EAED), 0);
-            lv_label_set_text(stat_label, acc.stat_line.c_str());
+        if (acc.local_stats && acc.today_tokens >= 0) {
+            auto usage_line = [&](const char* tag, long long tokens, int requests, double cost) {
+                std::string line = tag;
+                line += " " + usage::FormatTokens(tokens);
+                if (requests >= 0) {
+                    line += " · " + std::to_string(requests) + "次";
+                }
+                line += usage::CostSuffix(cost);
+                lv_obj_t* row_label = lv_label_create(card);
+                lv_obj_set_width(row_label, lv_pct(100));
+                lv_obj_set_height(row_label, 20);
+                lv_label_set_long_mode(row_label, LV_LABEL_LONG_DOT);
+                lv_obj_set_style_text_font(row_label, PanelTextFont(), 0);
+                lv_obj_set_style_text_color(row_label, lv_color_hex(0xE8EAED), 0);
+                lv_label_set_text(row_label, line.c_str());
+            };
+            usage_line("日", acc.today_tokens, acc.requests, acc.today_cost);
+            usage_line("周", acc.week_tokens, acc.week_requests, acc.week_cost);
+            std::string total = "累计 " + usage::FormatTokens(acc.lifetime_tokens) +
+                                usage::CostSuffix(acc.lifetime_cost);
+            lv_obj_t* total_label = lv_label_create(card);
+            lv_obj_set_width(total_label, lv_pct(100));
+            lv_obj_set_height(total_label, 20);
+            lv_label_set_long_mode(total_label, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(total_label, PanelTextFont(), 0);
+            lv_obj_set_style_text_color(total_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(total_label, total.c_str());
         }
 
-        if (acc.remaining_5h >= 0) {
-            AddUsageBarRow(card, acc.local_stats ? "日" : "5h", acc.remaining_5h);
+        if (!acc.local_stats && acc.remaining_5h >= 0) {
+            AddUsageBarRow(card, "5h", acc.remaining_5h);
         }
-        if (acc.remaining_weekly >= 0) {
+        if (!acc.local_stats && acc.remaining_weekly >= 0) {
             AddUsageBarRow(card, "周", acc.remaining_weekly);
         }
     }
@@ -1820,13 +1841,16 @@ private:
         };
         if ((!acc.local_stats && acc.remaining_5h >= 0) || local_has_today) {
             std::string value = local_value(acc.today_tokens, acc.requests, acc.today_cost);
+            // 本机条目不显示窗口重置时间（reset 传 -1），官方账号保持倒计时
             AddDetailBarBlock(content, acc.local_stats ? "当天用量" : "5小时窗口",
-                              acc.remaining_5h, acc.reset_5h, acc.local_stats ? &value : nullptr);
+                              acc.remaining_5h, acc.local_stats ? -1 : acc.reset_5h,
+                              acc.local_stats ? &value : nullptr);
         }
         if ((!acc.local_stats && acc.remaining_weekly >= 0) || local_has_week) {
-            std::string value = local_value(acc.week_tokens, acc.requests, acc.week_cost);
+            std::string value = local_value(acc.week_tokens, acc.week_requests, acc.week_cost);
             AddDetailBarBlock(content, acc.local_stats ? "本周用量" : "每周窗口",
-                              acc.remaining_weekly, acc.reset_weekly, acc.local_stats ? &value : nullptr);
+                              acc.remaining_weekly, acc.local_stats ? -1 : acc.reset_weekly,
+                              acc.local_stats ? &value : nullptr);
         }
         if (!acc.local_stats && acc.remaining_cr >= 0) {
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
@@ -1886,6 +1910,23 @@ private:
             AddDetailInfoLine(content, line, 0x9AA0A6);
         }
 
+        // 本机条目：数据更新时间 + 下次自动刷新倒计时（未配置自动刷新则只显示更新时间）
+        if (acc.local_stats && usage_updated_at_ > 0) {
+            char time_buf[16];
+            strftime(time_buf, sizeof(time_buf), "%H:%M", localtime(&usage_updated_at_));
+            std::string line = "更新 " + std::string(time_buf);
+            int minutes = GetUsageRefreshMinutes();
+            if (minutes > 0 && usage_query_started_at_ > 0) {
+                int remain = minutes * 60 - (int)(time(nullptr) - usage_query_started_at_);
+                if (remain > 0) {
+                    char remain_buf[32];
+                    snprintf(remain_buf, sizeof(remain_buf), " · %d分%02d秒后刷新", remain / 60, remain % 60);
+                    line += remain_buf;
+                }
+            }
+            AddDetailInfoLine(content, line, 0x9AA0A6);
+        }
+
         if (!acc.last_refresh.empty()) {
             AddDetailInfoLine(content, "Token刷新 " + acc.last_refresh, 0x9AA0A6);
         }
@@ -1900,8 +1941,13 @@ private:
         StartUsagePanelWatchdog();
     }
 
+    // 每页卡片数按源区分：官方账号 3 张/页；本机统计卡更高（三行数据），2 台/页
+    int UsageCardsPerPage() const {
+        return usage_source_ == kUsageSourceLocal ? 2 : kUsageCardsPerPage;
+    }
+
     int UsageListPages() {
-        return ((int)CurrentDetails().size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage;
+        return ((int)CurrentDetails().size() + UsageCardsPerPage() - 1) / UsageCardsPerPage();
     }
 
     // 列表页：当前页的 3 张卡片完整显示（不滚动）+ 页码导航行。
@@ -1925,8 +1971,8 @@ private:
         DisplayLockGuard lock(GetDisplay());
         lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
-        int begin = CurrentListPage() * kUsageCardsPerPage;
-        int end = std::min(begin + kUsageCardsPerPage, (int)CurrentDetails().size());
+        int begin = CurrentListPage() * UsageCardsPerPage();
+        int end = std::min(begin + UsageCardsPerPage(), (int)CurrentDetails().size());
         for (int i = begin; i < end; i++) {
             AddUsageCard(content, CurrentDetails()[i]);
         }
@@ -1966,7 +2012,7 @@ private:
         if (api_list_page_ >= ((int)api_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage) {
             api_list_page_ = 0;
         }
-        if (local_list_page_ >= ((int)local_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage) {
+        if (local_list_page_ >= ((int)local_details_.size() + 1) / 2) {
             local_list_page_ = 0;
         }
 
@@ -2123,7 +2169,7 @@ private:
                     self->BackToUsageList();
                 } else {
                     // 从当前页的第一个账号进入详情（超出总数时由详情页取模回绕）
-                    self->ShowUsageDetailPanel(self->CurrentListPage() * self->kUsageCardsPerPage);
+                    self->ShowUsageDetailPanel(self->CurrentListPage() * self->UsageCardsPerPage());
                 }
                 return;
             }

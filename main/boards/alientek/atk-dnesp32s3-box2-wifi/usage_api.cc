@@ -816,8 +816,8 @@ int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc, const Socks5
 
 // 本机统计服务（PC 端 box2-usage-server，明文 HTTP）GET /usage。
 // 服务端聚合 Claude Code 与 Codex CLI 的本地会话记录：当天/本周 token 与费用、
-// 近 14 天逐日、累计/峰值/连续天数、按模型分类。percent 为已用百分比（-1 未配置上限）。
-// 成功时 locals 追加三张维度卡片（当天/本周/累计），各对应一个详情页；
+    // 近 14 天逐日、累计/峰值/连续天数、按模型分类。
+    // 成功时 locals 追加三张维度卡片（当天/本周/累计），各对应一个详情页；
 // 失败时追加一个 unavailable 条目。返回 200 成功；HTTP 状态码；-1 网络；-2 解析失败
 int FetchLocalUsage(const std::string& host, int port, const std::string& key,
                            const std::string& name_suffix, std::vector<AccountDetail>& locals) {
@@ -844,15 +844,6 @@ int FetchLocalUsage(const std::string& host, int port, const std::string& key,
     auto number_value = [](cJSON* parent, const char* key) -> long long {
         cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, key) : nullptr;
         return cJSON_IsNumber(item) ? (long long)item->valuedouble : -1;
-    };
-    // 今日/本周窗口：服务端给已用百分比，面板统一显示剩余（与官方账号卡片同语义）
-    auto window_remaining = [](cJSON* parent) -> int {
-        cJSON* pct = parent != nullptr ? cJSON_GetObjectItem(parent, "percent") : nullptr;
-        if (!cJSON_IsNumber(pct) || pct->valueint < 0) {
-            return -1;
-        }
-        int remaining = 100 - pct->valueint;
-        return remaining < 0 ? 0 : remaining;
     };
     auto cost_value = [](cJSON* parent) -> double {
         cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, "cost") : nullptr;
@@ -912,55 +903,28 @@ int FetchLocalUsage(const std::string& host, int port, const std::string& key,
     }
     cJSON_Delete(root);
 
-    std::string source = "Claude Code @ " + host;
-    auto make_entry = [&](const char* name) {
-        AccountDetail acc;
-        acc.name = name_suffix.empty() ? name : name + ("@" + name_suffix);
-        acc.email = source;
-        acc.local_stats = true;
-        return acc;
-    };
-    // 数值行/详情数值统一带请求数："1.2万 · 15次 ($0.03)"
-    auto usage_line = [](long long tokens, int requests, double cost) {
-        std::string line = FormatTokens(tokens);
-        if (requests >= 0) {
-            line += " · " + std::to_string(requests) + "次";
-        }
-        line += CostSuffix(cost);
-        return line;
-    };
+    // 每台 PC 一个条目携带全量数据（Claude Code/ZCode/Codex 多 CLI 聚合）：
+    // 列表页一张卡浓缩 当天/本周/累计 三行，详情页一页展示该台全部信息
+    AccountDetail acc;
+    acc.name = name_suffix.empty() ? "本地" : "本地@" + name_suffix;
+    acc.email = "AI CLI @ " + host;
+    acc.plan = "本地";
+    acc.local_stats = true;
+    acc.today_tokens = today_tokens;
+    acc.today_cost = today_cost;
+    acc.requests = today_requests;
+    acc.week_tokens = week_tokens;
+    acc.week_cost = week_cost;
+    acc.week_requests = week_requests;
+    acc.reset_5h = reset_day;      // 列表卡片倒计时：到当日午夜
+    acc.lifetime_tokens = lifetime_tokens;
+    acc.lifetime_cost = lifetime_cost;
+    acc.peak_daily_tokens = peak_daily_tokens;
+    acc.current_streak_days = streak_days;
+    acc.local_models = std::move(model_stats);
+    acc.daily_buckets = std::move(buckets);
 
-    AccountDetail day_acc = make_entry("当天");
-    day_acc.plan = "本地";
-    day_acc.remaining_5h = window_remaining(today);
-    day_acc.reset_5h = reset_day;
-    day_acc.today_tokens = today_tokens;
-    day_acc.today_cost = today_cost;
-    day_acc.requests = today_requests;
-    day_acc.stat_line = usage_line(today_tokens, today_requests, today_cost);
-    day_acc.daily_buckets = buckets;
-
-    AccountDetail week_acc = make_entry("本周");
-    week_acc.remaining_weekly = window_remaining(week);
-    week_acc.reset_weekly = reset_week;
-    week_acc.week_tokens = week_tokens;
-    week_acc.week_cost = week_cost;
-    week_acc.requests = week_requests;
-    week_acc.stat_line = usage_line(week_tokens, week_requests, week_cost);
-    week_acc.daily_buckets = buckets;
-
-    AccountDetail total_acc = make_entry("累计");
-    total_acc.lifetime_tokens = lifetime_tokens;
-    total_acc.lifetime_cost = lifetime_cost;
-    total_acc.peak_daily_tokens = peak_daily_tokens;
-    total_acc.current_streak_days = streak_days;
-    total_acc.stat_line = FormatTokens(lifetime_tokens) + CostSuffix(lifetime_cost);
-    total_acc.local_models = std::move(model_stats);
-    total_acc.daily_buckets = std::move(buckets);
-
-    locals.push_back(std::move(day_acc));
-    locals.push_back(std::move(week_acc));
-    locals.push_back(std::move(total_acc));
+    locals.push_back(std::move(acc));
     ESP_LOGI(TAG, "Local usage: today=%lld week=%lld lifetime=%lld cost=%.2f",
              today_tokens, week_tokens, lifetime_tokens, lifetime_cost);
     return 200;
