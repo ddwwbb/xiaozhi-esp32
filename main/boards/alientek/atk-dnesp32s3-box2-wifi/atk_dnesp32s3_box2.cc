@@ -19,6 +19,7 @@
 #include <esp_lcd_panel_vendor.h>
 #include <esp_http_server.h>
 #include <esp_netif.h>
+#include <nvs.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -532,13 +533,32 @@ private:
     }
 
 
+    // NVS 分区（默认 "nvs"，16KB）剩余空间是否够写 length 字节的字符串值。
+    // 空间不足时 Settings::SetString 内部的 ESP_ERROR_CHECK 会直接 abort 重启，必须预检
+    static bool NvsHasSpaceFor(size_t length) {
+        nvs_stats_t stats = {};
+        if (nvs_get_stats("nvs", &stats) != ESP_OK) {
+            return true;  // 统计失败不阻塞正常路径
+        }
+        size_t need_entries = (length + 31) / 32 + 2;      // 值 entry + key 开销
+        return stats.free_entries > need_entries + 8;      // 余量防页内碎片
+    }
+
     static esp_err_t UsageConfigImportHandler(httpd_req_t* req) {
         if (req->content_len > 16384) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body too large");
             return ESP_FAIL;
         }
         std::vector<char> buf(req->content_len + 1, 0);
-        int received = httpd_req_recv(req, buf.data(), req->content_len);
+        // TCP 分段时一次 recv 可能只收到部分 body，循环读满
+        int received = 0;
+        while (received < (int)req->content_len) {
+            int n = httpd_req_recv(req, buf.data() + received, req->content_len - received);
+            if (n <= 0) {
+                break;
+            }
+            received += n;
+        }
         if (received <= 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
             return ESP_FAIL;
@@ -589,6 +609,16 @@ private:
         if (printed == nullptr) {
             cJSON_Delete(root);
             SendSimplePage(req, "<h3>导入失败：序列化错误</h3>", "返回");
+            return ESP_OK;
+        }
+        // NVS 单值受一页（4KB）容量限制，且分区总空间仅 16KB；
+        // 超限或空间不足时不写入（SetString 失败会 abort 重启）
+        size_t printed_len = strlen(printed);
+        if (printed_len > 3600 || !NvsHasSpaceFor(printed_len)) {
+            cJSON_free(printed);
+            cJSON_Delete(root);
+            SendSimplePage(req, "<h3>导入失败：令牌过大或设备存储空间不足，"
+                                "可删除不用的账号后重试</h3>", "返回");
             return ESP_OK;
         }
         if (replace_index >= 0) {
