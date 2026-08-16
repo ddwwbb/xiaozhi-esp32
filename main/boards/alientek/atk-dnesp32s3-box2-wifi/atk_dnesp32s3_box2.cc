@@ -48,6 +48,10 @@
 
 #define TAG "atk_dnesp32s3_box2_wifi"
 
+// 用量面板补字字体：内置 noto 子集缺 周/日/分/智/谱 等字，由 simhei 子集补齐（板目录内随构建编入）
+LV_FONT_DECLARE(font_usage_extra_20);
+LV_FONT_DECLARE(font_usage_small_14);
+
 class atk_dnesp32s3_box2_wifi : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;   
@@ -85,6 +89,21 @@ private:
         long long peak_daily_tokens = -1;
         long current_streak_days = -1;
         int reset_credits = -1;  // 可用限额重置积分
+        double lifetime_cost = -1;  // 累计费用（美元），本机统计用，-1 未知
+        // 本机 Claude Code 统计卡片（PC 端 box2-usage-server）：窗口语义是 今日/本周 而非 5h/周，
+        // 核心信息是 token 数与费用（无官方配额概念，进度条仅自定义上限时显示）
+        bool local_stats = false;
+        long long today_tokens = -1;
+        long long week_tokens = -1;
+        double today_cost = -1;
+        double week_cost = -1;
+        struct ModelStat {
+            std::string name;
+            long long tokens;
+            double cost;
+            bool priced;
+        };
+        std::vector<ModelStat> local_models;
         // api-call wham/usage 查询结果
         int remaining_5h = -1;
         int remaining_weekly = -1;
@@ -102,6 +121,9 @@ private:
     // 面板数据缓存：列表页与详情页共用；-1 表示当前是列表页
     std::vector<AccountDetail> usage_details_;
     int usage_detail_index_ = -1;
+    // 列表分页：240x320 屏每页完整显示 3 张卡片
+    int usage_list_page_ = 0;
+    static constexpr int kUsageCardsPerPage = 3;
     // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
     esp_timer_handle_t usage_refresh_timer_ = nullptr;
     esp_timer_handle_t usage_watch_timer_ = nullptr;
@@ -110,7 +132,6 @@ private:
     int loading_dots_ = 0;
     int pending_detail_restore_ = -1;
     time_t usage_updated_at_ = 0;
-
 
     // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 codex auth.json 格式
     static std::string CodexAuthKey(int index) {
@@ -142,9 +163,56 @@ private:
         settings.SetInt("codex_auth_count", (int)jsons.size());
     }
 
+    // 智谱官方 API Key（NVS，vendor 命名空间），最多 4 个
+    static std::string ZhipuKeyKey(int index) {
+        return "zhipu_key_" + std::to_string(index + 1);
+    }
+
+    std::vector<std::string> LoadZhipuKeys() {
+        std::vector<std::string> keys;
+        Settings settings("vendor");
+        int count = settings.GetInt("zhipu_key_count", 0);
+        for (int i = 0; i < count && i < 4; i++) {
+            std::string key = settings.GetString(ZhipuKeyKey(i), "");
+            if (!key.empty()) {
+                keys.push_back(std::move(key));
+            }
+        }
+        return keys;
+    }
+
+    void SaveZhipuKeys(const std::vector<std::string>& keys) {
+        Settings settings("vendor", true);
+        int old_count = settings.GetInt("zhipu_key_count", 0);
+        for (int i = (int)keys.size(); i < old_count; i++) {
+            settings.EraseKey(ZhipuKeyKey(i));
+        }
+        for (size_t i = 0; i < keys.size(); i++) {
+            settings.SetString(ZhipuKeyKey((int)i), keys[i]);
+        }
+        settings.SetInt("zhipu_key_count", (int)keys.size());
+    }
+
     int GetUsageRefreshMinutes() {
         Settings settings("vendor");
         return settings.GetInt("usage_refresh_minutes", 0);
+    }
+
+    // 本机统计服务（PC 端 box2-usage-server）地址；host 为空表示功能关闭
+    std::string GetLocalUsageHost() {
+        Settings settings("vendor");
+        return settings.GetString("local_usage_host", "");
+    }
+
+    int GetLocalUsagePort() {
+        Settings settings("vendor");
+        int port = settings.GetInt("local_usage_port", 3939);
+        return (port > 0 && port < 65536) ? port : 3939;
+    }
+
+    std::string GetLocalUsageKey() {
+        Settings settings("vendor");
+        return settings.GetString("local_usage_key", "");
     }
 
     // 直连模式可选代理（socks5 或 http CONNECT，均支持账号密码认证）
@@ -166,6 +234,17 @@ private:
         proxy.user = settings.GetString("usage_proxy_user", "");
         proxy.pass = settings.GetString("usage_proxy_pass", "");
         return proxy;
+    }
+
+    // 代理适用范围：ChatGPT 默认走代理（国内访问官方接口必需），智谱默认直连（国内站）
+    bool ChatGptUseProxy() {
+        Settings settings("vendor");
+        return settings.GetInt("usage_chatgpt_proxy", 1) != 0;
+    }
+
+    bool ZhipuUseProxy() {
+        Settings settings("vendor");
+        return settings.GetInt("usage_zhipu_proxy", 0) != 0;
     }
 
     void InitializeBoardPowerManager() {
@@ -308,13 +387,16 @@ private:
     static std::string GetConfigPage() {
         auto cfg_proxy = instance_->GetSocks5Config();
         int refresh_minutes = instance_->GetUsageRefreshMinutes();
+        std::string local_host = instance_->GetLocalUsageHost();
+        std::string local_port = std::to_string(instance_->GetLocalUsagePort());
+        std::string local_key = instance_->GetLocalUsageKey();
 
         std::string page =
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             "<title>用量查询配置</title></head>"
             "<body style=\"font-family:sans-serif;max-width:520px;margin:24px auto\">"
-            "<h2>ChatGPT 用量查询配置（官方接口直连）</h2>"
+            "<h2>AI 用量查询配置（官方接口直连）</h2>"
             "<h3>直连账号</h3>";
 
         auto jsons = instance_->LoadDirectAuthJsons();
@@ -345,6 +427,28 @@ private:
                 "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 8 个</small></p>"
                 "</form>"
 
+                "<h3>智谱 AI 令牌（官方 API Key）</h3>"
+                "<p><small>粘贴智谱开放平台（open.bigmodel.cn）的 API Key，"
+                "查询 GLM 套餐 token 用量（5 小时/每周窗口）。最多 4 个。</small></p>";
+
+        auto zhipu_keys = instance_->LoadZhipuKeys();
+        for (size_t i = 0; i < zhipu_keys.size(); i++) {
+            std::string tail = zhipu_keys[i].size() > 6 ? zhipu_keys[i].substr(zhipu_keys[i].size() - 6) : zhipu_keys[i];
+            page += "<form method=\"POST\" action=\"/zhipu_delete\" style=\"margin:2px 0\">"
+                    "<input type=\"hidden\" name=\"index\" value=\"" + std::to_string(i) + "\">"
+                    "<button type=\"submit\" style=\"width:100%;text-align:left\">" +
+                    std::to_string(i + 1) + ". 智谱 ****" + tail + "  [删除]</button></form>";
+        }
+        if (!zhipu_keys.empty()) {
+            page += "<br>";
+        }
+
+        page += "<form method=\"POST\" action=\"/zhipu_import\">"
+                "<textarea name=\"zhipu_key\" rows=\"2\" style=\"width:100%\" "
+                "placeholder=\"粘贴智谱 API Key，形如 xxxxxxxxxx.xxxxxxxx\"></textarea>"
+                "<p><button type=\"submit\">导入智谱令牌</button> <small>同一 Key 重复导入会覆盖</small></p>"
+                "</form>"
+
                 "<form method=\"POST\" action=\"/save\">"
 
                 "<h3>网络代理（可选，访问官方接口需要）</h3>"
@@ -362,6 +466,23 @@ private:
                 "\" style=\"width:120px\"> "
                 "密码 <input name=\"proxy_pass\" type=\"password\" value=\"" + cfg_proxy.pass +
                 "\" style=\"width:120px\"> <small>无认证可留空；Clash/v2ray 混合端口两种类型都支持</small></p>"
+                "<p>代理范围：ChatGPT <select name=\"chatgpt_proxy\">"
+                "<option value=\"1\"" + std::string(instance_->ChatGptUseProxy() ? " selected" : "") + ">走代理</option>"
+                "<option value=\"0\"" + std::string(!instance_->ChatGptUseProxy() ? " selected" : "") + ">直连</option>"
+                "</select> · 智谱 <select name=\"zhipu_proxy\">"
+                "<option value=\"0\"" + std::string(!instance_->ZhipuUseProxy() ? " selected" : "") + ">直连（推荐）</option>"
+                "<option value=\"1\"" + std::string(instance_->ZhipuUseProxy() ? " selected" : "") + ">走代理</option>"
+                "</select></p>"
+
+                "<h3>本机统计（可选）</h3>"
+                "<p><small>PC 上运行 box2-usage-server（Claude Code 用量/费用统计）时填其地址，"
+                "面板末尾追加本地CC卡片（当天/本周/近14天/累计token与费用）。地址留空并保存即关闭。</small><br>"
+                "地址 <input name=\"local_usage_host\" value=\"" + local_host +
+                "\" style=\"width:130px\" placeholder=\"192.168.1.2\"> "
+                "端口 <input name=\"local_usage_port\" type=\"number\" value=\"" + local_port +
+                "\" style=\"width:70px\"> "
+                "密钥 <input name=\"local_usage_key\" value=\"" + local_key +
+                "\" style=\"width:100px\" placeholder=\"可留空\"></p>"
 
                 "<h3>自动刷新</h3>"
                 "<p>间隔分钟（0=关闭，面板 15 秒自动关闭；大于 0 时面板常驻并按此间隔自动刷新）<br>"
@@ -492,6 +613,9 @@ private:
         settings.EraseKey("usage_proxy_port");
         settings.EraseKey("usage_proxy_user");
         settings.EraseKey("usage_proxy_pass");
+        // 范围一并回到默认：ChatGPT 走代理、智谱直连
+        settings.SetInt("usage_chatgpt_proxy", 1);
+        settings.SetInt("usage_zhipu_proxy", 0);
         SendSimplePage(req, "<h3>已清除代理设置</h3>", "返回");
         return ESP_OK;
     }
@@ -516,8 +640,131 @@ private:
         return ESP_OK;
     }
 
+    // 智谱 API Key 会拼进 Authorization 头，必须拒绝空白与控制字符（防头注入）
+    static bool ValidZhipuKey(const std::string& key) {
+        if (key.size() < 20 || key.size() > 128) {
+            return false;
+        }
+        for (char c : key) {
+            if (c <= 0x20 || c >= 0x7F) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 本机统计地址拼进 Host 头与 TcpConnect，只允许 IPv4/域名字符（防注入）
+    static bool ValidLocalHost(const std::string& host) {
+        if (host.empty() || host.size() > 63) {
+            return false;
+        }
+        for (char c : host) {
+            if (!isalnum((unsigned char)c) && c != '.' && c != '-') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 本机统计密钥拼进 URL query 与 HTML value 属性，只允许无歧义 ASCII 可见字符
+    // （排除空白/控制/& # % 与引号尖括号，防 query 截断、请求行注入与属性闭合）
+    static bool ValidLocalKey(const std::string& key) {
+        if (key.empty() || key.size() > 64) {
+            return false;
+        }
+        for (char c : key) {
+            if (c <= 0x20 || c >= 0x7F) {
+                return false;
+            }
+            if (c == '&' || c == '#' || c == '%' || c == '"' || c == '\'' || c == '<' || c == '>') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static esp_err_t UsageConfigZhipuImportHandler(httpd_req_t* req) {
+        char body[512] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        std::string key = GetFormField(body, "zhipu_key");
+
+        cJSON* root = cJSON_Parse(key.c_str());
+        if (root != nullptr) {
+            // 容错：直接粘贴了 {"api_key":"..."} 之类的 JSON 时取字符串字段
+            const char* fields[] = {"api_key", "apiKey", "key", "token"};
+            std::string extracted;
+            for (const char* field : fields) {
+                cJSON* item = cJSON_GetObjectItem(root, field);
+                if (cJSON_IsString(item)) {
+                    extracted = item->valuestring;
+                    break;
+                }
+            }
+            cJSON_Delete(root);
+            // 可解析为 JSON 却不含已知令牌字段：粘贴的是错误内容，整体判无效，
+            // 防止 JSON 文本本身恰好通过 ValidZhipuKey 被存入 NVS
+            if (extracted.empty()) {
+                SendSimplePage(req, "<h3>导入失败：不是有效的智谱 API Key（形如 xxxxxxxxxx.xxxxxxxx）</h3>", "返回");
+                return ESP_OK;
+            }
+            key = extracted;
+        }
+
+        if (!ValidZhipuKey(key)) {
+            SendSimplePage(req, "<h3>导入失败：不是有效的智谱 API Key（形如 xxxxxxxxxx.xxxxxxxx）</h3>", "返回");
+            return ESP_OK;
+        }
+
+        auto keys = instance_->LoadZhipuKeys();
+        int replace_index = -1;
+        for (size_t i = 0; i < keys.size(); i++) {
+            if (keys[i] == key) {
+                replace_index = (int)i;
+                break;
+            }
+        }
+        if (replace_index < 0 && keys.size() >= 4) {
+            SendSimplePage(req, "<h3>导入失败：最多 4 个智谱令牌</h3>", "返回");
+            return ESP_OK;
+        }
+        if (replace_index >= 0) {
+            keys[replace_index] = key;
+        } else {
+            keys.push_back(key);
+        }
+        instance_->SaveZhipuKeys(keys);
+
+        SendSimplePage(req, "<h3>已导入智谱令牌，当前共 " + std::to_string(keys.size()) + " 个</h3>", "返回");
+        return ESP_OK;
+    }
+
+    static esp_err_t UsageConfigZhipuDeleteHandler(httpd_req_t* req) {
+        char body[128] = {0};
+        size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
+        int received = httpd_req_recv(req, body, total);
+        if (received <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
+            return ESP_FAIL;
+        }
+        int index = atoi(GetFormField(body, "index").c_str());
+        auto keys = instance_->LoadZhipuKeys();
+        if (index < 0 || index >= (int)keys.size()) {
+            SendSimplePage(req, "<h3>删除失败：索引无效</h3>", "返回");
+            return ESP_OK;
+        }
+        keys.erase(keys.begin() + index);
+        instance_->SaveZhipuKeys(keys);
+        SendSimplePage(req, "<h3>已删除，剩余 " + std::to_string(keys.size()) + " 个智谱令牌</h3>", "返回");
+        return ESP_OK;
+    }
+
     static esp_err_t UsageConfigSaveHandler(httpd_req_t* req) {
-        char body[768] = {0};
+        char body[1024] = {0};
         size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
         int received = httpd_req_recv(req, body, total);
         if (received <= 0) {
@@ -531,10 +778,21 @@ private:
         auto proxy_port = GetFormField(body, "proxy_port");
         auto proxy_user = GetFormField(body, "proxy_user");
         auto proxy_pass = GetFormField(body, "proxy_pass");
+        auto chatgpt_proxy = GetFormField(body, "chatgpt_proxy");
+        auto zhipu_proxy = GetFormField(body, "zhipu_proxy");
+        auto local_host = GetFormField(body, "local_usage_host");
+        auto local_port = GetFormField(body, "local_usage_port");
+        auto local_key = GetFormField(body, "local_usage_key");
 
         Settings settings("vendor", true);
         if (!proxy_type.empty()) {
             settings.SetString("usage_proxy_type", proxy_type == "http" ? "http" : "socks5");
+        }
+        if (!chatgpt_proxy.empty()) {
+            settings.SetInt("usage_chatgpt_proxy", atoi(chatgpt_proxy.c_str()) != 0 ? 1 : 0);
+        }
+        if (!zhipu_proxy.empty()) {
+            settings.SetInt("usage_zhipu_proxy", atoi(zhipu_proxy.c_str()) != 0 ? 1 : 0);
         }
         if (!proxy_host.empty()) {
             settings.SetString("usage_proxy_host", proxy_host);
@@ -556,6 +814,26 @@ private:
             if (minutes < 0) minutes = 0;
             if (minutes > 1440) minutes = 1440;
             settings.SetInt("usage_refresh_minutes", minutes);
+        }
+        // 本机统计地址：该输入框总随表单提交，留空保存即清除（关闭本机卡片）
+        if (ValidLocalHost(local_host)) {
+            settings.SetString("local_usage_host", local_host);
+        } else {
+            settings.EraseKey("local_usage_host");
+        }
+        if (!local_port.empty()) {
+            int port = atoi(local_port.c_str());
+            if (port > 0 && port < 65536) {
+                settings.SetInt("local_usage_port", port);
+            }
+        }
+        if (!local_key.empty()) {
+            // 非法密钥直接清除：该值会拼进 URL query 与 HTML 属性，不落 NVS
+            if (ValidLocalKey(local_key)) {
+                settings.SetString("local_usage_key", local_key);
+            } else {
+                settings.EraseKey("local_usage_key");
+            }
         }
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_send(req, "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head>"
@@ -640,6 +918,18 @@ private:
         delete_uri.handler = UsageConfigDeleteHandler;
         httpd_register_uri_handler(usage_config_server_, &delete_uri);
 
+        httpd_uri_t zhipu_import_uri = {};
+        zhipu_import_uri.uri = "/zhipu_import";
+        zhipu_import_uri.method = HTTP_POST;
+        zhipu_import_uri.handler = UsageConfigZhipuImportHandler;
+        httpd_register_uri_handler(usage_config_server_, &zhipu_import_uri);
+
+        httpd_uri_t zhipu_delete_uri = {};
+        zhipu_delete_uri.uri = "/zhipu_delete";
+        zhipu_delete_uri.method = HTTP_POST;
+        zhipu_delete_uri.handler = UsageConfigZhipuDeleteHandler;
+        httpd_register_uri_handler(usage_config_server_, &zhipu_delete_uri);
+
         httpd_uri_t clear_proxy_uri = {};
         clear_proxy_uri.uri = "/clear_proxy";
         clear_proxy_uri.method = HTTP_POST;
@@ -664,14 +954,14 @@ private:
         ESP_LOGI(TAG, "Usage config mode: http://%s/", ip.c_str());
     }
 
-    // 用导入的账号令牌直连官方接口查询用量并展示
-    void StartChatGptUsageQuery() {
+    // 用导入的令牌直连官方接口查询用量并展示（ChatGPT 账号 + 智谱 API Key）
+    void StartUsageQuery() {
         if (usage_fetching_.exchange(true)) {
             return;
         }
         if (xTaskCreate([](void* arg) {
                 auto self = static_cast<atk_dnesp32s3_box2_wifi*>(arg);
-                self->QueryChatGptUsage();
+                self->QueryUsage();
                 self->usage_fetching_ = false;
                 vTaskDelete(nullptr);
             }, "usage_query", 10240, this, 4, nullptr) != pdPASS) {
@@ -744,18 +1034,62 @@ private:
             details.push_back(std::move(acc));
         }
 
+        // 智谱官方 API Key：独立于 ChatGPT 账号，查 GLM 套餐 token 用量
+        auto zhipu_keys = LoadZhipuKeys();
+        for (size_t i = 0; i < zhipu_keys.size(); i++) {
+            AccountDetail acc;
+            std::string tail = zhipu_keys[i].size() > 6 ? zhipu_keys[i].substr(zhipu_keys[i].size() - 6)
+                                                        : zhipu_keys[i];
+            acc.name = "智谱*" + tail;
+            if (zhipu_keys.size() > 1) {
+                acc.name = "智谱" + std::to_string(i + 1) + " *" + tail;
+            }
+            acc.email = "智谱开放平台 ****" + tail;
+            int status = FetchZhipuUsage(zhipu_keys[i], acc);
+            if (status == 200) {
+                ok_count++;
+            } else if (status == 400 || status == 401 || status == 403 || status == -2) {
+                acc.unavailable = true;
+            }
+            details.push_back(std::move(acc));
+        }
+
+        // 本机 Claude Code 统计：PC 端 box2-usage-server（地址在配置页设置）。
+        // 服务不可达只标记本卡片 unavailable，不影响其他账号
+        std::string local_host = GetLocalUsageHost();
+        if (!local_host.empty()) {
+            AccountDetail acc;
+            acc.name = "本地CC";
+            acc.email = "Claude Code @ " + local_host;
+            acc.local_stats = true;
+            int status = FetchLocalUsage(local_host, GetLocalUsagePort(), acc);
+            if (status == 200) {
+                ok_count++;
+            } else {
+                acc.unavailable = true;
+            }
+            details.push_back(std::move(acc));
+        }
+
         if (details.empty() || ok_count == 0) {
             HideUsagePanel();
-            GetDisplay()->ShowNotification("直连查询失败:令牌失效或无法访问chatgpt.com", 4000);
+            // 全部为本机卡片时，失败原因一定是本地服务而非官方令牌
+            bool all_local = !details.empty();
+            for (const auto& d : details) {
+                all_local = all_local && d.local_stats;
+            }
+            GetDisplay()->ShowNotification(all_local ? "本机统计服务不可达,检查PC端"
+                                                     : "直连查询失败:令牌失效或网络不可达",
+                                           4000);
             return;
         }
         ShowUsageListPanel(std::move(details));
     }
 
-    void QueryChatGptUsage() {
+    void QueryUsage() {
         pending_detail_restore_ = usage_detail_index_;
-        if (LoadDirectAuthJsons().empty()) {
-            GetDisplay()->ShowNotification("未导入账号令牌,长按Q键配置", 3000);
+        if (LoadDirectAuthJsons().empty() && LoadZhipuKeys().empty() && GetLocalUsageHost().empty()) {
+            GetDisplay()->ShowNotification("未导入令牌,长按Q键配置", 3000);
             return;
         }
         // 自动刷新时面板已在显示，跳过 loading 重建避免闪烁，数据到达后直接替换
@@ -1003,7 +1337,6 @@ private:
             mbedtls_ssl_config_free(&conf);
         }
 
-
         static int SendCb(void* ctx, const unsigned char* buf, size_t len) {
             int fd = (int)(intptr_t)ctx;
             int n = send(fd, buf, len, 0);
@@ -1135,11 +1468,15 @@ private:
         return true;
     }
 
-    // HTTPS 请求（走/不走 SOCKS5 均可）：Connection: close，一次一连接
+    // HTTPS 请求（use_proxy=false 时强制直连）：Connection: close，一次一连接
     static bool HttpsRequest(const std::string& host, const std::string& path, const char* method,
                              const std::vector<std::pair<std::string, std::string>>& headers,
-                             const std::string& body, int& status_code, std::string& resp_body) {
-        auto proxy = instance_->GetSocks5Config();
+                             const std::string& body, int& status_code, std::string& resp_body,
+                             bool use_proxy = true) {
+        Socks5Config proxy;
+        if (use_proxy) {
+            proxy = instance_->GetSocks5Config();
+        }
         std::string connect_host = proxy.enabled() ? proxy.host : host;
         int connect_port = proxy.enabled() ? proxy.port : 443;
 
@@ -1183,6 +1520,64 @@ private:
 
         // 解析状态行
         if (raw.compare(0, 5, "HTTP/") != 0) {
+            return false;
+        }
+        size_t sp = raw.find(' ');
+        if (sp == std::string::npos) {
+            return false;
+        }
+        status_code = atoi(raw.c_str() + sp + 1);
+
+        size_t header_end = raw.find("\r\n\r\n");
+        if (header_end == std::string::npos) {
+            resp_body.clear();
+            return true;
+        }
+        std::string header_block = raw.substr(0, header_end);
+        resp_body = raw.substr(header_end + 4);
+        std::string lower;
+        lower.reserve(header_block.size());
+        for (char c : header_block) {
+            lower.push_back((char)tolower((unsigned char)c));
+        }
+        if (lower.find("transfer-encoding: chunked") != std::string::npos) {
+            HttpsDechunk(resp_body);
+        }
+        return true;
+    }
+
+    // 明文 HTTP GET（局域网本机统计服务，不走代理不做 TLS）：Connection: close，一次一连接，
+    // 读到对端关闭为止；解析逻辑与 HttpsRequest 一致（状态行/chunked）
+    static bool PlainHttpGet(const std::string& host, int port, const std::string& path,
+                             int& status_code, std::string& resp_body) {
+        int fd = TcpConnect(host, port, 5000);
+        if (fd < 0) {
+            return false;
+        }
+        std::string req = "GET " + path + " HTTP/1.1\r\n";
+        req += "Host: " + host + "\r\nConnection: close\r\nAccept: application/json\r\n\r\n";
+        bool ok = true;
+        size_t sent = 0;
+        while (ok && sent < req.size()) {
+            int n = send(fd, req.data() + sent, req.size() - sent, 0);
+            if (n <= 0) {
+                ok = false;
+            } else {
+                sent += n;
+            }
+        }
+        std::string raw;
+        char buf[1024];
+        // 本机统计含 14 天 buckets 与全量模型分类，上限比 HttpsRequest 宽
+        while (ok && raw.size() < 48 * 1024) {
+            int n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                break;
+            }
+            raw.append(buf, n);
+        }
+        close(fd);
+        if (!ok || raw.empty() || raw.compare(0, 5, "HTTP/") != 0) {
             return false;
         }
         size_t sp = raw.find(' ');
@@ -1293,7 +1688,8 @@ private:
         };
         int status = 0;
         std::string body;
-        if (!HttpsRequest("chatgpt.com", "/backend-api/wham/usage", "GET", headers, "", status, body)) {
+        if (!HttpsRequest("chatgpt.com", "/backend-api/wham/usage", "GET", headers, "", status, body,
+                          instance_->ChatGptUseProxy())) {
             ESP_LOGE(TAG, "Direct usage: request failed (%s)", acc.name.c_str());
             return -1;
         }
@@ -1339,7 +1735,8 @@ private:
 
         int status = 0;
         std::string body;
-        if (HttpsRequest("chatgpt.com", "/backend-api/wham/profiles/me", "GET", headers, "", status, body) &&
+        if (HttpsRequest("chatgpt.com", "/backend-api/wham/profiles/me", "GET", headers, "", status, body,
+                         instance_->ChatGptUseProxy()) &&
             status == 200) {
             cJSON* root = cJSON_Parse(body.c_str());
             cJSON* stats = root != nullptr ? cJSON_GetObjectItem(root, "stats") : nullptr;
@@ -1366,7 +1763,7 @@ private:
 
         status = 0;
         if (HttpsRequest("chatgpt.com", "/backend-api/wham/rate-limit-reset-credits", "GET", headers, "",
-                         status, body) &&
+                         status, body, instance_->ChatGptUseProxy()) &&
             status == 200) {
             cJSON* root = cJSON_Parse(body.c_str());
             cJSON* count = root != nullptr ? cJSON_GetObjectItem(root, "available_count") : nullptr;
@@ -1375,6 +1772,231 @@ private:
             }
             cJSON_Delete(root);
         }
+    }
+
+    // 把智谱 limits 条目写入对应窗口槽位（unit：3=5小时窗 6=周窗，percentage 为已用百分比）
+    static void ApplyZhipuLimit(cJSON* limit_item, int unit_value, AccountDetail& acc) {
+        cJSON* pct = cJSON_GetObjectItem(limit_item, "percentage");
+        if (!cJSON_IsNumber(pct)) {
+            return;
+        }
+        int remaining = 100 - (int)(pct->valuedouble + 0.5);
+        if (remaining < 0) {
+            remaining = 0;
+        }
+        if (remaining > 100) {
+            remaining = 100;
+        }
+        int reset = -1;
+        cJSON* next_reset = cJSON_GetObjectItem(limit_item, "nextResetTime");
+        if (cJSON_IsNumber(next_reset) && next_reset->valuedouble > 0) {
+            reset = (int)(next_reset->valuedouble / 1000.0) - (int)time(nullptr);
+            if (reset <= 0) {
+                reset = -1;
+            }
+        }
+        if (unit_value == 3 && acc.remaining_5h < 0) {
+            acc.remaining_5h = remaining;
+            acc.reset_5h = reset;
+        } else if (unit_value == 6 && acc.remaining_weekly < 0) {
+            acc.remaining_weekly = remaining;
+            acc.reset_weekly = reset;
+        }
+    }
+
+    // 直连智谱官方接口 GET open.bigmodel.cn/api/monitor/usage/quota/limit。
+    // 请求与响应形态照搬 cc-switch 的实测：Authorization 头直接放 API Key 不加 Bearer；
+    // data.level 为套餐等级；data.limits[] 的 type 取 TOKENS_LIMIT/CREDIT_LIMIT，
+    // percentage 为已用百分比、nextResetTime 为毫秒时间戳、unit 标识窗口（3=5小时 6=周）。
+    // 返回 200 成功；HTTP 状态码原样返回；-1 网络失败；-2 响应异常（业务错误/解析失败）
+    static int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc) {
+        std::vector<std::pair<std::string, std::string>> headers = {
+            {"Authorization", api_key},
+            {"Content-Type", "application/json"},
+        };
+        int status = 0;
+        std::string body;
+        if (!HttpsRequest("open.bigmodel.cn", "/api/monitor/usage/quota/limit", "GET", headers, "", status, body,
+                          instance_->ZhipuUseProxy())) {
+            ESP_LOGE(TAG, "Zhipu usage: request failed (%s)", acc.name.c_str());
+            return -1;
+        }
+        if (status != 200) {
+            ESP_LOGE(TAG, "Zhipu usage: HTTP %d (%s)", status, acc.name.c_str());
+            return status;
+        }
+
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            ESP_LOGE(TAG, "Zhipu usage: bad json (%s)", acc.name.c_str());
+            return -2;
+        }
+        cJSON* success = cJSON_GetObjectItem(root, "success");
+        if (cJSON_IsFalse(success)) {
+            cJSON* msg = cJSON_GetObjectItem(root, "msg");
+            ESP_LOGE(TAG, "Zhipu usage: API error: %s",
+                     cJSON_IsString(msg) ? msg->valuestring : "unknown");
+            cJSON_Delete(root);
+            return -2;
+        }
+        cJSON* data = cJSON_GetObjectItem(root, "data");
+        if (data == nullptr) {
+            cJSON_Delete(root);
+            return -2;
+        }
+        cJSON* level = cJSON_GetObjectItem(data, "level");
+        if (cJSON_IsString(level) && level->valuestring[0] != '\0') {
+            acc.plan = level->valuestring;
+        }
+
+        // 窗口分类：unit 显式标识优先；缺失时兜底——无重置时间的条目优先归
+        // 5 小时窗，其余按重置时间升序填入空槽（智谱最多两条，与 cc-switch 一致）
+        cJSON* fallback[2] = {nullptr, nullptr};
+        int fallback_count = 0;
+        cJSON* limits = cJSON_GetObjectItem(data, "limits");
+        if (cJSON_IsArray(limits)) {
+            cJSON* item = nullptr;
+            cJSON_ArrayForEach(item, limits) {
+                cJSON* type = cJSON_GetObjectItem(item, "type");
+                if (!cJSON_IsString(type)) {
+                    continue;
+                }
+                if (strcasecmp(type->valuestring, "TOKENS_LIMIT") != 0 &&
+                    strcasecmp(type->valuestring, "CREDIT_LIMIT") != 0) {
+                    continue;
+                }
+                cJSON* unit = cJSON_GetObjectItem(item, "unit");
+                int unit_value = cJSON_IsNumber(unit) ? unit->valueint : -1;
+                if (unit_value == 3 || unit_value == 6) {
+                    ApplyZhipuLimit(item, unit_value, acc);
+                } else if (fallback_count < 2) {
+                    fallback[fallback_count++] = item;
+                }
+            }
+        }
+        if (fallback_count == 2) {
+            auto reset_ms = [](cJSON* item) -> long long {
+                cJSON* next_reset = cJSON_GetObjectItem(item, "nextResetTime");
+                return cJSON_IsNumber(next_reset) ? (long long)next_reset->valuedouble : -1;
+            };
+            if (reset_ms(fallback[1]) < reset_ms(fallback[0])) {
+                std::swap(fallback[0], fallback[1]);
+            }
+        }
+        // 兜底条目按序填入仍空缺的槽位（5h 优先，其次周窗）：
+        // 显式 unit 已占住 5h 时，剩余条目应落周窗而非被丢弃
+        for (int i = 0; i < fallback_count; i++) {
+            ApplyZhipuLimit(fallback[i], acc.remaining_5h < 0 ? 3 : 6, acc);
+        }
+
+        cJSON_Delete(root);
+        ESP_LOGI(TAG, "Zhipu usage: %s 5h=%d%% weekly=%d%%",
+                 acc.name.c_str(), acc.remaining_5h, acc.remaining_weekly);
+        return 200;
+    }
+
+    // 本机统计服务（PC 端 box2-usage-server，明文 HTTP）GET /usage。
+    // 服务端按 message.id 去重聚合 ~/.claude/projects 的 JSONL：今日/本周 token 与费用、
+    // 近 14 天逐日、累计/峰值/连续天数、按模型分类。percent 为已用百分比（-1 未配置上限）。
+    // 返回 200 成功；HTTP 状态码原样返回；-1 网络失败；-2 响应解析失败
+    static int FetchLocalUsage(const std::string& host, int port, AccountDetail& acc) {
+        std::string path = "/usage";
+        std::string key = instance_->GetLocalUsageKey();
+        if (!key.empty()) {
+            path += "?key=" + key;
+        }
+        int status = 0;
+        std::string body;
+        if (!PlainHttpGet(host, port, path, status, body)) {
+            ESP_LOGE(TAG, "Local usage: request failed (%s:%d)", host.c_str(), port);
+            return -1;
+        }
+        if (status != 200) {
+            ESP_LOGE(TAG, "Local usage: HTTP %d (%s:%d)", status, host.c_str(), port);
+            return status;
+        }
+
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            ESP_LOGE(TAG, "Local usage: bad json");
+            return -2;
+        }
+        cJSON* plan_item = cJSON_GetObjectItem(root, "plan");
+        if (cJSON_IsString(plan_item) && plan_item->valuestring[0] != '\0') {
+            acc.plan = plan_item->valuestring;
+        }
+        auto number_value = [](cJSON* parent, const char* key) -> long long {
+            cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, key) : nullptr;
+            return cJSON_IsNumber(item) ? (long long)item->valuedouble : -1;
+        };
+        // 今日/本周窗口：服务端给已用百分比，面板统一显示剩余（与官方账号卡片同语义）
+        auto window_remaining = [](cJSON* parent) -> int {
+            cJSON* pct = parent != nullptr ? cJSON_GetObjectItem(parent, "percent") : nullptr;
+            if (!cJSON_IsNumber(pct) || pct->valueint < 0) {
+                return -1;
+            }
+            int remaining = 100 - pct->valueint;
+            return remaining < 0 ? 0 : remaining;
+        };
+        cJSON* today = cJSON_GetObjectItem(root, "today");
+        cJSON* week = cJSON_GetObjectItem(root, "week");
+        acc.remaining_5h = window_remaining(today);
+        acc.remaining_weekly = window_remaining(week);
+        acc.today_tokens = number_value(today, "tokens");
+        acc.week_tokens = number_value(week, "tokens");
+        auto cost_value = [](cJSON* parent) -> double {
+            cJSON* item = parent != nullptr ? cJSON_GetObjectItem(parent, "cost") : nullptr;
+            return cJSON_IsNumber(item) && item->valuedouble >= 0 ? item->valuedouble : -1;
+        };
+        acc.today_cost = cost_value(today);
+        acc.week_cost = cost_value(week);
+        acc.reset_5h = (int)number_value(root, "reset_after_seconds");
+        acc.reset_weekly = (int)number_value(root, "weekly_reset_after_seconds");
+        if (acc.reset_5h <= 0) {
+            acc.reset_5h = -1;
+        }
+        if (acc.reset_weekly <= 0) {
+            acc.reset_weekly = -1;
+        }
+        acc.lifetime_tokens = number_value(root, "lifetime_tokens");
+        acc.peak_daily_tokens = number_value(root, "peak_daily_tokens");
+        acc.current_streak_days = (long)number_value(root, "streak_days");
+        cJSON* cost = cJSON_GetObjectItem(root, "lifetime_cost");
+        if (cJSON_IsNumber(cost) && cost->valuedouble >= 0) {
+            acc.lifetime_cost = cost->valuedouble;
+        }
+        cJSON* model_item = nullptr;
+        cJSON_ArrayForEach(model_item, cJSON_GetObjectItem(root, "models")) {
+            cJSON* name_item = cJSON_GetObjectItem(model_item, "model");
+            cJSON* tokens_item = cJSON_GetObjectItem(model_item, "tokens");
+            if (!cJSON_IsString(name_item) || !cJSON_IsNumber(tokens_item)) {
+                continue;
+            }
+            AccountDetail::ModelStat stat;
+            stat.name = name_item->valuestring;
+            stat.tokens = (long long)tokens_item->valuedouble;
+            stat.cost = cost_value(model_item);
+            cJSON* priced_item = cJSON_GetObjectItem(model_item, "priced");
+            stat.priced = !cJSON_IsFalse(priced_item);
+            acc.local_models.push_back(std::move(stat));
+        }
+        cJSON* bucket = nullptr;
+        cJSON_ArrayForEach(bucket, cJSON_GetObjectItem(root, "daily_buckets")) {
+            cJSON* date_item = cJSON_GetObjectItem(bucket, "date");
+            cJSON* tokens_item = cJSON_GetObjectItem(bucket, "tokens");
+            if (cJSON_IsString(date_item) && cJSON_IsNumber(tokens_item)) {
+                acc.daily_buckets.emplace_back(date_item->valuestring,
+                                               (long long)tokens_item->valuedouble);
+            }
+        }
+        cJSON_Delete(root);
+        ESP_LOGI(TAG, "Local usage: today=%lld week=%lld lifetime=%lld cost=%.2f",
+                 today != nullptr && cJSON_IsNumber(cJSON_GetObjectItem(today, "tokens"))
+                     ? (long long)cJSON_GetObjectItem(today, "tokens")->valuedouble : -1,
+                 week != nullptr && cJSON_IsNumber(cJSON_GetObjectItem(week, "tokens"))
+                     ? (long long)cJSON_GetObjectItem(week, "tokens")->valuedouble : -1,
+                 acc.lifetime_tokens, acc.lifetime_cost);
+        return 200;
     }
 
     // OAuth 刷新令牌（codex 官方端点与参数），成功后把新令牌回写 NVS 并返回新 access_token
@@ -1393,7 +2015,8 @@ private:
         };
         int status = 0;
         std::string resp;
-        if (!HttpsRequest("auth.openai.com", "/oauth/token", "POST", headers, body, status, resp)) {
+        if (!HttpsRequest("auth.openai.com", "/oauth/token", "POST", headers, body, status, resp,
+                          instance_->ChatGptUseProxy())) {
             ESP_LOGE(TAG, "Token refresh: request failed");
             return "";
         }
@@ -1543,7 +2166,7 @@ private:
             esp_timer_create_args_t refresh_args = {
                 .callback = [](void* arg) {
                     if (instance_->usage_panel_ != nullptr) {
-                        instance_->StartChatGptUsageQuery();
+                        instance_->StartUsageQuery();
                     }
                 },
                 .arg = nullptr,
@@ -1593,14 +2216,30 @@ private:
         power_save_timer_->WakeUp();
     }
 
-    lv_obj_t* CreateUsagePanelBase(const char* title, const char* nav_hint) {
+    // 面板主字体：主题字体副本串补字 fallback（周/日/分/智/谱等不在内置字体子集）。
+    // 用副本是为了不被字幕动态字形缓存对主题字体 SetFallback 的覆盖影响
+    const lv_font_t* PanelTextFont() {
+        static lv_font_t font = [] {
+            lv_font_t f = *static_cast<LvglTheme*>(instance_->GetDisplay()->GetTheme())->text_font()->font();
+            f.fallback = &font_usage_extra_20;
+            return f;
+        }();
+        return &font;
+    }
+
+    // 卡片进度条行/列表导航行的小号字体（ASCII + 周时日分），保证每页 3 卡片完整显示
+    static const lv_font_t* PanelSmallFont() {
+        return &font_usage_small_14;
+    }
+
+    lv_obj_t* CreateUsagePanelBase(const char* title, const char* nav_hint, bool nav_small = true) {
         HideUsagePanel();
         auto display = GetDisplay();
         if (display->GetTheme() == nullptr) {
             return nullptr;
         }
         DisplayLockGuard lock(display);
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
 
         usage_panel_ = lv_obj_create(lv_screen_active());
         lv_obj_set_size(usage_panel_, LV_HOR_RES, LV_VER_RES);
@@ -1610,9 +2249,9 @@ private:
         lv_obj_set_style_bg_opa(usage_panel_, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(usage_panel_, 0, 0);
         lv_obj_set_style_border_width(usage_panel_, 0, 0);
-        lv_obj_set_style_pad_all(usage_panel_, 10, 0);
+        lv_obj_set_style_pad_all(usage_panel_, 6, 0);
         lv_obj_set_flex_flow(usage_panel_, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(usage_panel_, 6, 0);
+        lv_obj_set_style_pad_row(usage_panel_, 4, 0);
         lv_obj_clear_flag(usage_panel_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_text_font(usage_panel_, font, 0);
 
@@ -1640,7 +2279,10 @@ private:
 
         if (nav_hint != nullptr && nav_hint[0] != '\0') {
             lv_obj_t* nav = lv_label_create(usage_panel_);
+            // 列表导航用 14px 小字（高度预算紧）；详情页导航含更多汉字，用主字体
+            lv_obj_set_style_text_font(nav, nav_small ? PanelSmallFont() : PanelTextFont(), 0);
             lv_obj_set_style_text_color(nav, lv_color_hex(0x9AA0A6), 0);
+            lv_obj_set_height(nav, nav_small ? 16 : LV_SIZE_CONTENT);
             lv_label_set_text(nav, nav_hint);
         }
 
@@ -1650,20 +2292,19 @@ private:
         lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(content, 0, 0);
         lv_obj_set_style_pad_all(content, 0, 0);
-        lv_obj_set_style_pad_row(content, 6, 0);
+        lv_obj_set_style_pad_row(content, 4, 0);
         lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_AUTO);
         return content;
     }
 
-    // 一行进度条：标签 + 彩条 + 百分比
+    // 一行进度条：14px 小字、固定 16px 行高（每页 3 张卡片的高度预算内）
     void AddUsageBarRow(lv_obj_t* parent, const char* tag, int remaining_pct) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        auto font = PanelSmallFont();
 
         lv_obj_t* row = lv_obj_create(parent);
         lv_obj_set_width(row, lv_pct(100));
-        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_height(row, 16);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -1675,11 +2316,11 @@ private:
         lv_obj_t* tag_label = lv_label_create(row);
         lv_obj_set_style_text_font(tag_label, font, 0);
         lv_obj_set_style_text_color(tag_label, lv_color_hex(0x9AA0A6), 0);
-        lv_obj_set_width(tag_label, 26);
+        lv_obj_set_width(tag_label, 22);
         lv_label_set_text(tag_label, tag);
 
         lv_obj_t* bar = lv_bar_create(row);
-        lv_obj_set_height(bar, 10);
+        lv_obj_set_height(bar, 8);
         lv_obj_set_flex_grow(bar, 1);
         lv_bar_set_range(bar, 0, 100);
         lv_bar_set_value(bar, remaining_pct >= 0 ? remaining_pct : 0, LV_ANIM_OFF);
@@ -1693,14 +2334,13 @@ private:
         lv_obj_t* pct_label = lv_label_create(row);
         lv_obj_set_style_text_font(pct_label, font, 0);
         lv_obj_set_style_text_color(pct_label, lv_color_hex(0xE8EAED), 0);
-        lv_obj_set_width(pct_label, 42);
+        lv_obj_set_width(pct_label, 36);
         lv_obj_set_style_text_align(pct_label, LV_TEXT_ALIGN_RIGHT, 0);
         lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "%").c_str() : "?");
     }
 
     void AddUsageCard(lv_obj_t* parent, const AccountDetail& acc) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
 
         lv_obj_t* card = lv_obj_create(parent);
         lv_obj_set_width(card, lv_pct(100));
@@ -1709,8 +2349,8 @@ private:
         lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(card, 10, 0);
         lv_obj_set_style_border_width(card, 0, 0);
-        lv_obj_set_style_pad_all(card, 8, 0);
-        lv_obj_set_style_pad_row(card, 6, 0);
+        lv_obj_set_style_pad_all(card, 6, 0);
+        lv_obj_set_style_pad_row(card, 4, 0);
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -1761,8 +2401,30 @@ private:
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
+        // 本机统计卡片的核心信息是当日/本周消耗（无官方配额概念），进度条仅自定义上限时显示
+        if (acc.local_stats && (acc.today_tokens >= 0 || acc.week_tokens >= 0)) {
+            std::string line;
+            if (acc.today_tokens >= 0) {
+                line += "日 " + FormatTokens(acc.today_tokens) + CostSuffix(acc.today_cost);
+            }
+            if (acc.week_tokens >= 0) {
+                if (!line.empty()) {
+                    line += " ";
+                }
+                line += "周 " + FormatTokens(acc.week_tokens) + CostSuffix(acc.week_cost);
+            }
+            lv_obj_t* stat_label = lv_label_create(card);
+            lv_obj_set_width(stat_label, lv_pct(100));
+            lv_obj_set_height(stat_label, 20);
+            lv_label_set_long_mode(stat_label, LV_LABEL_LONG_DOT);
+            // 主字体：数值含 万/亿 单位，不在 14px 小字体的字符集里
+            lv_obj_set_style_text_font(stat_label, PanelTextFont(), 0);
+            lv_obj_set_style_text_color(stat_label, lv_color_hex(0xE8EAED), 0);
+            lv_label_set_text(stat_label, line.c_str());
+        }
+
         if (acc.remaining_5h >= 0) {
-            AddUsageBarRow(card, "5h", acc.remaining_5h);
+            AddUsageBarRow(card, acc.local_stats ? "日" : "5h", acc.remaining_5h);
         }
         if (acc.remaining_weekly >= 0) {
             AddUsageBarRow(card, "周", acc.remaining_weekly);
@@ -1770,13 +2432,13 @@ private:
     }
 
     void ShowUsagePanelLoading() {
-        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
+        lv_obj_t* content = CreateUsagePanelBase("AI 用量", nullptr);
         if (content == nullptr) {
             GetDisplay()->ShowNotification("查询套餐用量...", 8000);
             return;
         }
         DisplayLockGuard lock(GetDisplay());
-        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
 
         lv_obj_t* row = lv_obj_create(content);
         lv_obj_set_width(row, lv_pct(100));
@@ -1820,10 +2482,11 @@ private:
         esp_timer_start_periodic(usage_loading_timer_, 500000);
     }
 
-    // 详情页窗口块：标签行（名称+重置 左，剩余百分比 右）+ 大进度条，共两行
-    void AddDetailBarBlock(lv_obj_t* parent, const char* title, int remaining_pct, int reset_seconds) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+    // 详情页窗口块：标签行（名称+重置 左，剩余百分比 右）+ 大进度条，共两行。
+    // value_text 非空时（本机统计）右侧显示该文本而非剩余百分比，且未配置上限时不渲染进度条
+    void AddDetailBarBlock(lv_obj_t* parent, const char* title, int remaining_pct, int reset_seconds,
+                           const std::string* value_text = nullptr) {
+        auto font = PanelTextFont();
 
         lv_obj_t* head = lv_obj_create(parent);
         lv_obj_set_width(head, lv_pct(100));
@@ -1847,9 +2510,19 @@ private:
 
         lv_obj_t* pct_label = lv_label_create(head);
         lv_obj_set_style_text_font(pct_label, font, 0);
-        lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
-        lv_label_set_text(pct_label, remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
+        if (value_text != nullptr) {
+            lv_obj_set_style_text_color(pct_label, lv_color_hex(0xE8EAED), 0);
+            lv_label_set_text(pct_label, value_text->c_str());
+        } else {
+            lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
+            lv_label_set_text(pct_label,
+                              remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
+        }
 
+        // 本机统计未配置上限（-1）时只有标签行
+        if (value_text != nullptr && remaining_pct < 0) {
+            return;
+        }
         lv_obj_t* bar = lv_bar_create(parent);
         lv_obj_set_width(bar, lv_pct(100));
         lv_obj_set_height(bar, 14);
@@ -1878,10 +2551,29 @@ private:
         return label;
     }
 
+    // 费用后缀，如 " ($0.57)"；未知返回空（"费"字不在补字字体，用 $ 表达）
+    static std::string CostSuffix(double cost) {
+        if (cost < 0) {
+            return "";
+        }
+        char label[20];
+        snprintf(label, sizeof(label), " ($%.2f)", cost);
+        return label;
+    }
+
+    // 模型行右侧费用列：未定价/未知显示 "-"
+    static std::string CostText(double cost, bool priced) {
+        if (!priced || cost < 0) {
+            return "-";
+        }
+        char label[20];
+        snprintf(label, sizeof(label), "$%.2f", cost);
+        return label;
+    }
+
     // 每日 token 用量柱状图（官方 daily_usage_buckets，取末尾最多 14 天）
     void AddDailyTokensChart(lv_obj_t* parent, const std::vector<std::pair<std::string, long long>>& buckets) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
 
         lv_obj_t* chart = lv_obj_create(parent);
         lv_obj_set_width(chart, lv_pct(100));
@@ -1924,8 +2616,7 @@ private:
     }
 
     void AddDetailInfoLine(lv_obj_t* parent, const std::string& text, uint32_t color) {
-        auto display = GetDisplay();
-        auto font = static_cast<LvglTheme*>(display->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
         lv_obj_t* label = lv_label_create(parent);
         lv_obj_set_style_text_font(label, font, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
@@ -1933,7 +2624,35 @@ private:
         lv_label_set_text(label, text.c_str());
     }
 
-    // M 键从列表进入的单账号详情页；数据来自 usage_details_ 缓存
+    // 模型分类行：左模型名（超长省略）右 token+费用；主字体（含 万/亿/其余模型 等字），行高 20
+    void AddModelRow(lv_obj_t* parent, const std::string& name, const std::string& value) {
+        auto font = PanelTextFont();
+        lv_obj_t* row = lv_obj_create(parent);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, 20);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* name_label = lv_label_create(row);
+        lv_obj_set_style_text_font(name_label, font, 0);
+        lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
+        lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_flex_grow(name_label, 1);
+        lv_label_set_text(name_label, name.c_str());
+
+        lv_obj_t* value_label = lv_label_create(row);
+        lv_obj_set_style_text_font(value_label, font, 0);
+        lv_obj_set_style_text_color(value_label, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(value_label, value.c_str());
+    }
+
+    // M 键从列表进入的单账号详情页；数据来自 usage_details_ 缓存。
+    // 智谱账号显示与列表卡片相同的内容（套餐徽章 + 5h/周窗口），无数据的块自动隐藏
     void ShowUsageDetailPanel(int index) {
         if (usage_details_.empty()) {
             return;
@@ -1944,14 +2663,14 @@ private:
 
         std::string nav = "< " + std::to_string(index + 1) + "/" + std::to_string(usage_details_.size()) +
                          " >  音量键切换 · M键返回";
-        lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str());
+        lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str(), false);
         if (content == nullptr) {
             GetDisplay()->ShowNotification("详情页创建失败", 3000);
             return;
         }
 
         DisplayLockGuard lock(GetDisplay());
-        auto font = static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->font();
+        auto font = PanelTextFont();
 
         // 邮箱 + 套餐徽章
         lv_obj_t* title_row = lv_obj_create(content);
@@ -1991,14 +2710,21 @@ private:
             AddDetailInfoLine(content, "订阅有效至 " + acc.subscription_until, 0x9AA0A6);
         }
 
-        // 限额窗口：接口未返回该项数据时整块隐藏
-        if (acc.remaining_5h >= 0) {
-            AddDetailBarBlock(content, "5小时窗口", acc.remaining_5h, acc.reset_5h);
+        // 限额窗口：接口未返回该项数据时整块隐藏；本机统计卡片是 今日/本周 语义，
+        // 右侧显示 token 数与费用，仅自定义上限配置后显示进度条
+        bool local_has_today = acc.local_stats && acc.today_tokens >= 0;
+        bool local_has_week = acc.local_stats && acc.week_tokens >= 0;
+        if ((!acc.local_stats && acc.remaining_5h >= 0) || local_has_today) {
+            std::string value = FormatTokens(acc.today_tokens) + CostSuffix(acc.today_cost);
+            AddDetailBarBlock(content, acc.local_stats ? "当天用量" : "5小时窗口",
+                              acc.remaining_5h, acc.reset_5h, acc.local_stats ? &value : nullptr);
         }
-        if (acc.remaining_weekly >= 0) {
-            AddDetailBarBlock(content, "每周窗口", acc.remaining_weekly, acc.reset_weekly);
+        if ((!acc.local_stats && acc.remaining_weekly >= 0) || local_has_week) {
+            std::string value = FormatTokens(acc.week_tokens) + CostSuffix(acc.week_cost);
+            AddDetailBarBlock(content, acc.local_stats ? "本周用量" : "每周窗口",
+                              acc.remaining_weekly, acc.reset_weekly, acc.local_stats ? &value : nullptr);
         }
-        if (acc.remaining_cr >= 0) {
+        if (!acc.local_stats && acc.remaining_cr >= 0) {
             AddDetailBarBlock(content, "代码审查", acc.remaining_cr, acc.reset_cr);
         }
 
@@ -2011,6 +2737,30 @@ private:
             AddDetailInfoLine(content, "近" + std::to_string(days) + "天token用量(高峰黄色)", 0x9AA0A6);
             AddDailyTokensChart(content, acc.daily_buckets);
         }
+        // 本机统计：按模型分类（ccswitch 各供应商用量），Top4 + 其余汇总
+        if (acc.local_stats && !acc.local_models.empty()) {
+            AddDetailInfoLine(content, "模型分类", 0x9AA0A6);
+            size_t shown = acc.local_models.size() > 4 ? 4 : acc.local_models.size();
+            for (size_t i = 0; i < shown; i++) {
+                const auto& m = acc.local_models[i];
+                AddModelRow(content, m.name,
+                            FormatTokens(m.tokens) + " " + CostText(m.cost, m.priced));
+            }
+            if (acc.local_models.size() > shown) {
+                long long rest_tokens = 0;
+                double rest_cost = 0;
+                bool rest_priced = true;
+                for (size_t i = shown; i < acc.local_models.size(); i++) {
+                    rest_tokens += acc.local_models[i].tokens;
+                    rest_cost += acc.local_models[i].cost > 0 ? acc.local_models[i].cost : 0;
+                    rest_priced = rest_priced && acc.local_models[i].priced;
+                }
+                // 含未定价模型时费用被低估，显示 "-" 而非误导性的 $0.00
+                AddModelRow(content, "其余" + std::to_string(acc.local_models.size() - shown) + "模型",
+                            FormatTokens(rest_tokens) + " " + CostText(rest_cost, rest_priced));
+            }
+        }
+
         std::string stats_line;
         if (acc.current_streak_days >= 0) {
             stats_line += "连续" + std::to_string(acc.current_streak_days) + "天";
@@ -2023,14 +2773,22 @@ private:
             AddDetailInfoLine(content, stats_line, 0x9AA0A6);
         }
         if (acc.lifetime_tokens >= 0) {
-            AddDetailInfoLine(content, "累计token " + FormatTokens(acc.lifetime_tokens), 0x9AA0A6);
+            std::string line = "累计token " + FormatTokens(acc.lifetime_tokens);
+            if (acc.lifetime_cost >= 0) {
+                char cost_label[24];
+                snprintf(cost_label, sizeof(cost_label), " ($%.2f)", acc.lifetime_cost);
+                line += cost_label;
+            }
+            AddDetailInfoLine(content, line, 0x9AA0A6);
         }
 
         if (!acc.last_refresh.empty()) {
             AddDetailInfoLine(content, "Token刷新 " + acc.last_refresh, 0x9AA0A6);
         }
         if (acc.unavailable) {
-            AddDetailInfoLine(content, "状态: 令牌异常,建议重新导入", 0xEA4335);
+            AddDetailInfoLine(content, acc.local_stats ? "状态: 服务不可达,检查PC端服务"
+                                                       : "状态: 令牌异常,建议重新导入",
+                              0xEA4335);
         }
 
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(30000000LL));
@@ -2038,32 +2796,66 @@ private:
         StartUsagePanelWatchdog();
     }
 
-    // M 键在详情页再按时回到列表
-    void BackToUsageList() {
-        if (usage_details_.empty()) {
-            HideUsagePanel();
-            return;
-        }
-        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
+    int UsageListPages() {
+        return ((int)usage_details_.size() + kUsageCardsPerPage - 1) / kUsageCardsPerPage;
+    }
+
+    // 列表页：当前页的 3 张卡片完整显示（不滚动）+ 页码导航行
+    void ShowUsageListPage() {
+        int pages = UsageListPages();
+        std::string nav = pages > 1
+                              ? "< " + std::to_string(usage_list_page_ + 1) + "/" + std::to_string(pages) +
+                                    " >  L/R翻页 M详情"
+                              : "M详情 Q关闭";
+        lv_obj_t* content = CreateUsagePanelBase("AI 用量", nav.c_str());
         if (content == nullptr) {
-            HideUsagePanel();
+            GetDisplay()->ShowNotification("用量面板创建失败", 3000);
             return;
         }
         usage_detail_index_ = -1;
+
         DisplayLockGuard lock(GetDisplay());
-        for (auto& acc : usage_details_) {
-            AddUsageCard(content, acc);
+        lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(content, LV_SCROLLBAR_MODE_OFF);
+        int begin = usage_list_page_ * kUsageCardsPerPage;
+        int end = std::min(begin + kUsageCardsPerPage, (int)usage_details_.size());
+        for (int i = begin; i < end; i++) {
+            AddUsageCard(content, usage_details_[i]);
         }
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
         StartUsageAutoRefresh();
         StartUsagePanelWatchdog();
     }
 
+    // 列表模式翻页（循环）
+    void SwitchUsageListPage(int step) {
+        int pages = UsageListPages();
+        if (pages <= 1) {
+            return;
+        }
+        usage_list_page_ = ((usage_list_page_ + step) % pages + pages) % pages;
+        ShowUsageListPage();
+    }
 
-    // 列表页；自动刷新后恢复原详情页
+    // M 键在详情页再按时回到列表（保持当前页）
+    void BackToUsageList() {
+        if (usage_details_.empty()) {
+            HideUsagePanel();
+            return;
+        }
+        ShowUsageListPage();
+        if (usage_panel_ == nullptr) {
+            HideUsagePanel();
+        }
+    }
+
+    // 新数据到达；自动刷新后恢复原详情页
     void ShowUsageListPanel(std::vector<AccountDetail> details) {
         usage_details_ = std::move(details);
         usage_updated_at_ = time(nullptr);
+        if (usage_list_page_ >= UsageListPages()) {
+            usage_list_page_ = 0;
+        }
 
         int restore = pending_detail_restore_;
         pending_detail_restore_ = -1;
@@ -2072,20 +2864,7 @@ private:
             return;
         }
 
-        lv_obj_t* content = CreateUsagePanelBase("ChatGPT 用量", nullptr);
-        if (content == nullptr) {
-            GetDisplay()->ShowNotification("用量面板创建失败", 3000);
-            return;
-        }
-        usage_detail_index_ = -1;
-
-        DisplayLockGuard lock(GetDisplay());
-        for (auto& acc : usage_details_) {
-            AddUsageCard(content, acc);
-        }
-        RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(15000000LL));
-        StartUsageAutoRefresh();
-        StartUsagePanelWatchdog();
+        ShowUsageListPage();
     }
 
     esp_err_t IoExpanderSetLevel(uint16_t pin_mask, uint8_t level) {
@@ -2200,6 +2979,10 @@ private:
                 self->ShowUsageDetailPanel(self->usage_detail_index_ - 1);
                 return;
             }
+            if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
+                self->SwitchUsageListPage(-1);
+                return;
+            }
             self->audio_volume_change(false);
         }, this);
 
@@ -2216,7 +2999,8 @@ private:
                 if (self->usage_detail_index_ >= 0) {
                     self->BackToUsageList();
                 } else {
-                    self->ShowUsageDetailPanel(0);
+                    // 从当前页的第一个账号进入详情（超出总数时由详情页取模回绕）
+                    self->ShowUsageDetailPanel(self->usage_list_page_ * self->kUsageCardsPerPage);
                 }
                 return;
             }
@@ -2260,7 +3044,7 @@ private:
                 if (self->usage_panel_ != nullptr) {
                     self->HideUsagePanel();
                 } else {
-                    self->StartChatGptUsageQuery();
+                    self->StartUsageQuery();
                 }
             }
         }, this);
@@ -2280,6 +3064,10 @@ private:
             self->power_save_timer_->WakeUp();
             if (self->usage_detail_index_ >= 0) {
                 self->ShowUsageDetailPanel(self->usage_detail_index_ + 1);
+                return;
+            }
+            if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
+                self->SwitchUsageListPage(1);
                 return;
             }
             self->audio_volume_change(true);
@@ -2398,6 +3186,9 @@ public:
         InitializePowerSaveTimer();
         InitializePowerManager();
         InitializeSt7789Display();
+        // 系统级文本（通知等）的主题字体串补字 fallback；字幕动态字形激活后会替换该
+        // fallback，用量面板因使用独立字体副本（PanelTextFont）不受影响
+        static_cast<LvglTheme*>(GetDisplay()->GetTheme())->text_font()->SetFallback(&font_usage_extra_20);
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
         InitializeBoardPowerManager();
