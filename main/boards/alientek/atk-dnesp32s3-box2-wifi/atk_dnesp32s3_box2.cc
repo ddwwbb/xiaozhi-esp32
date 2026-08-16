@@ -176,10 +176,10 @@ private:
     std::vector<AccountDetail> local_details_;
     int api_detail_index_ = -1;   // 当前详情页账号（-1=列表页）
     int local_detail_index_ = -1;
-    // 列表分页：官方账号 3 张/页；本机统计卡更高（三行数据），每页固定 2 台
+    // 240x320 竖屏统一每页 2 张卡片，避免内容拥挤或被裁切
     int api_list_page_ = 0;
     int local_list_page_ = 0;
-    static constexpr int kUsageCardsPerPage = 3;
+    static constexpr int kUsageCardsPerPage = 2;
     static constexpr int kLocalCardsPerPage = 2;
     // 面板显示期间的自动刷新（0=关闭），以及自动刷新后恢复到原详情页
     esp_timer_handle_t usage_refresh_timer_ = nullptr;
@@ -192,11 +192,22 @@ private:
     int pending_detail_restore_ = -1;
     time_t usage_updated_at_ = 0;
 
-    // 直连模式的账号令牌（NVS，vendor 命名空间），内容为 codex auth.json 格式
+    // ChatGPT 令牌（NVS，vendor 命名空间），内容为 Codex auth.json 格式
     static constexpr int kMaxDirectAccounts = 4;
 
     static std::string CodexAuthKey(int index) {
         return "codex_auth_" + std::to_string(index + 1);
+    }
+
+    static std::string AuthJsonString(const std::string& json, const char* key) {
+        cJSON* root = cJSON_Parse(json.c_str());
+        if (root == nullptr) {
+            return "";
+        }
+        cJSON* item = cJSON_GetObjectItem(root, key);
+        std::string value = cJSON_IsString(item) ? item->valuestring : "";
+        cJSON_Delete(root);
+        return value;
     }
 
     std::vector<std::string> LoadDirectAuthJsons() {
@@ -529,7 +540,7 @@ private:
 
         auto jsons = instance_->LoadDirectAuthJsons();
         if (jsons.empty()) {
-            page += "<p><small>尚未导入账号令牌。把 Codex 令牌文件（auth.json）内容粘贴到下面导入，"
+            page += "<p><small>尚未导入 ChatGPT 令牌。把 Codex 令牌文件（auth.json）内容粘贴到下面导入，"
                     "设备将直连官方接口查询用量并自动刷新令牌。</small></p>";
         } else {
             for (size_t i = 0; i < jsons.size(); i++) {
@@ -552,7 +563,7 @@ private:
         page += "<form method=\"POST\" action=\"/import\">"
                 "<textarea name=\"auth_json\" rows=\"5\" style=\"width:100%\" "
                 "placeholder=\"粘贴 Codex 令牌文件内容（auth.json，需含 refresh_token）\"></textarea>"
-                "<p><button type=\"submit\">导入令牌</button> <small>同一账号重复导入会覆盖，最多 4 个</small></p>"
+                "<p><button type=\"submit\">导入令牌</button> <small>不同令牌分别保存；相同令牌重复导入会覆盖，最多 4 个</small></p>"
                 "</form>"
 
                 "<h3>智谱 AI 令牌（官方 API Key）</h3>"
@@ -702,20 +713,6 @@ private:
         cJSON_DeleteItemFromObject(root, "account_id");
         cJSON_AddStringToObject(root, "account_id", account_id.c_str());
 
-        auto jsons = instance_->LoadDirectAuthJsons();
-        int replace_index = -1;
-        for (size_t i = 0; i < jsons.size(); i++) {
-            if (usage::ExtractAccountId(jsons[i]) == account_id) {
-                replace_index = (int)i;
-                break;
-            }
-        }
-        if (replace_index < 0 && jsons.size() >= kMaxDirectAccounts) {
-            cJSON_Delete(root);
-            SendSimplePage(req, "<h3>导入失败：最多 4 个账号</h3>", "返回");
-            return ESP_OK;
-        }
-
         char* printed = cJSON_PrintUnformatted(root);
         if (printed == nullptr) {
             cJSON_Delete(root);
@@ -729,6 +726,21 @@ private:
         cJSON_Delete(root);
         if (compact_json.empty()) {
             SendSimplePage(req, "<h3>导入失败：令牌整理失败</h3>", "返回");
+            return ESP_OK;
+        }
+        // 一个 ChatGPT 账号可能签发多个独立 refresh_token；仅完全相同的令牌视为重复导入。
+        // 不能只按 account_id 去重，否则第二个令牌会错误覆盖第一个槽位。
+        auto jsons = instance_->LoadDirectAuthJsons();
+        std::string refresh_token = AuthJsonString(compact_json, "refresh_token");
+        int replace_index = -1;
+        for (size_t i = 0; i < jsons.size(); i++) {
+            if (!refresh_token.empty() && AuthJsonString(jsons[i], "refresh_token") == refresh_token) {
+                replace_index = (int)i;
+                break;
+            }
+        }
+        if (replace_index < 0 && jsons.size() >= kMaxDirectAccounts) {
+            SendSimplePage(req, "<h3>导入失败：最多 4 个令牌</h3>", "返回");
             return ESP_OK;
         }
         // 超限或空间不足时不写入（SetString 失败会 abort 重启）
@@ -748,7 +760,7 @@ private:
             return ESP_OK;
         }
 
-        SendSimplePage(req, "<h3>已导入，当前共 " + std::to_string(jsons.size()) + " 个账号</h3>", "返回");
+        SendSimplePage(req, "<h3>已导入，当前共 " + std::to_string(jsons.size()) + " 个令牌</h3>", "返回");
         return ESP_OK;
     }
 
@@ -1576,7 +1588,7 @@ private:
         return &font;
     }
 
-    // 卡片进度条行/列表导航行的小号字体（ASCII + 周时日分），保证每页 3 卡片完整显示
+    // 卡片进度条行/导航行的小号字体（ASCII + 周时日分）
     static const lv_font_t* PanelSmallFont() {
         return &font_usage_small_14;
     }
@@ -1612,26 +1624,36 @@ private:
         lv_obj_set_style_border_width(header_row, 0, 0);
         lv_obj_set_style_pad_all(header_row, 0, 0);
         lv_obj_set_flex_flow(header_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(header_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(header_row, 6, 0);
+        lv_obj_set_flex_align(header_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(header_row, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t* header = lv_label_create(header_row);
         lv_obj_set_style_text_color(header, lv_color_hex(0xE8EAED), 0);
+        lv_obj_set_width(header, 0);
+        lv_obj_set_flex_grow(header, 1);
+        lv_label_set_long_mode(header, LV_LABEL_LONG_DOT);
         lv_label_set_text(header, title);
 
         std::string updated = FormatUpdatedAt(usage_updated_at_);
         if (!updated.empty()) {
             lv_obj_t* updated_label = lv_label_create(header_row);
+            lv_obj_set_style_text_font(updated_label, PanelSmallFont(), 0);
             lv_obj_set_style_text_color(updated_label, lv_color_hex(0x9AA0A6), 0);
+            lv_obj_set_width(updated_label, 74);
+            lv_obj_set_style_text_align(updated_label, LV_TEXT_ALIGN_RIGHT, 0);
+            lv_label_set_long_mode(updated_label, LV_LABEL_LONG_DOT);
             lv_label_set_text(updated_label, updated.c_str());
         }
 
         if (nav_hint != nullptr && nav_hint[0] != '\0') {
             lv_obj_t* nav = lv_label_create(usage_panel_);
-            // 列表导航用 14px 小字（高度预算紧）；详情页导航含更多汉字，用主字体
+            // 导航始终限制为单行，过长时省略，不能挤入下方内容
             lv_obj_set_style_text_font(nav, nav_small ? PanelSmallFont() : PanelTextFont(), 0);
             lv_obj_set_style_text_color(nav, lv_color_hex(0x9AA0A6), 0);
             lv_obj_set_height(nav, nav_small ? 16 : LV_SIZE_CONTENT);
+            lv_obj_set_width(nav, lv_pct(100));
+            lv_label_set_long_mode(nav, LV_LABEL_LONG_DOT);
             lv_label_set_text(nav, nav_hint);
         }
 
@@ -1647,7 +1669,7 @@ private:
         return content;
     }
 
-    // 一行进度条：14px 小字、固定 16px 行高（每页 3 张卡片的高度预算内）
+    // 一行进度条：14px 小字、固定 16px 行高
     void AddUsageBarRow(lv_obj_t* parent, const char* tag, int remaining_pct) {
         auto font = PanelSmallFont();
 
@@ -1693,7 +1715,8 @@ private:
 
         lv_obj_t* card = lv_obj_create(parent);
         lv_obj_set_width(card, lv_pct(100));
-        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        // 固定双卡高度；最后一页只有一条时也保持相同视觉密度
+        lv_obj_set_height(card, 124);
         lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2028), 0);
         lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(card, 10, 0);
@@ -1705,50 +1728,49 @@ private:
 
         lv_obj_t* title_row = lv_obj_create(card);
         lv_obj_set_width(title_row, lv_pct(100));
-        lv_obj_set_height(title_row, LV_SIZE_CONTENT);
+        lv_obj_set_height(title_row, 22);
         lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(title_row, 0, 0);
         lv_obj_set_style_pad_all(title_row, 0, 0);
         lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(title_row, 5, 0);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
-
-        if (acc.unavailable) {
-            lv_obj_t* alert = lv_label_create(title_row);
-            lv_obj_set_style_text_font(alert, font, 0);
-            lv_obj_set_style_text_color(alert, lv_color_hex(0xEA4335), 0);
-            lv_label_set_text(alert, "!");
-        }
 
         lv_obj_t* name_label = lv_label_create(title_row);
         lv_obj_set_style_text_font(name_label, font, 0);
-        lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
+        lv_obj_set_style_text_color(name_label, lv_color_hex(acc.unavailable ? 0xEA4335 : 0xE8EAED), 0);
         lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_label, 0);
         lv_obj_set_flex_grow(name_label, 1);
-        lv_label_set_text(name_label, acc.name.c_str());
-
-        // 倒计时：优先 5h 窗口/当天（到午夜），无则回落周窗口（到下周一）
-        std::string reset = FormatResetShort(acc.reset_5h > 0 ? acc.reset_5h : acc.reset_weekly);
-        if (!reset.empty()) {
-            lv_obj_t* reset_label = lv_label_create(title_row);
-            lv_obj_set_style_text_font(reset_label, font, 0);
-            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
-            lv_label_set_text(reset_label, reset.c_str());
-        }
+        std::string display_name = acc.unavailable ? "! " + acc.name : acc.name;
+        lv_label_set_text(name_label, display_name.c_str());
 
         if (!acc.plan.empty()) {
             uint32_t text_color = 0;
             uint32_t bg_color = 0;
             PlanBadgeColors(acc.plan, text_color, bg_color);
             lv_obj_t* plan_label = lv_label_create(title_row);
-            lv_obj_set_style_text_font(plan_label, font, 0);
+            lv_obj_set_style_text_font(plan_label, PanelSmallFont(), 0);
             lv_obj_set_style_text_color(plan_label, lv_color_hex(text_color), 0);
             lv_obj_set_style_bg_color(plan_label, lv_color_hex(bg_color), 0);
             lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(plan_label, 6, 0);
-            lv_obj_set_style_pad_hor(plan_label, 8, 0);
-            lv_obj_set_style_pad_ver(plan_label, 2, 0);
+            lv_obj_set_style_pad_hor(plan_label, 5, 0);
+            lv_obj_set_style_pad_ver(plan_label, 1, 0);
             lv_label_set_text(plan_label, acc.plan.c_str());
+        }
+
+        // 倒计时独占一行，不再与账号名和套餐徽章争抢横向空间
+        std::string reset = FormatResetShort(acc.reset_5h > 0 ? acc.reset_5h : acc.reset_weekly);
+        if (!reset.empty()) {
+            lv_obj_t* reset_label = lv_label_create(card);
+            lv_obj_set_width(reset_label, lv_pct(100));
+            lv_obj_set_height(reset_label, 16);
+            lv_obj_set_style_text_font(reset_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_long_mode(reset_label, LV_LABEL_LONG_DOT);
+            lv_label_set_text(reset_label, (reset + " 后重置").c_str());
         }
 
         // 本机统计卡片：一张卡浓缩 当天/本周/累计 三行（一页两台 PC）。
@@ -1757,7 +1779,7 @@ private:
             auto add_row = [&](const std::string& line, uint32_t color) {
                 lv_obj_t* row_label = lv_label_create(card);
                 lv_obj_set_width(row_label, lv_pct(100));
-                lv_obj_set_height(row_label, 20);
+                lv_obj_set_height(row_label, 18);
                 lv_label_set_long_mode(row_label, LV_LABEL_LONG_DOT);
                 lv_obj_set_style_text_font(row_label, PanelTextFont(), 0);
                 lv_obj_set_style_text_color(row_label, lv_color_hex(color), 0);
@@ -1837,40 +1859,67 @@ private:
         esp_timer_start_periodic(usage_loading_timer_, 500000);
     }
 
-    // 详情页窗口块：标签行（名称+重置 左，剩余百分比 右）+ 大进度条，共两行。
-    // value_text 非空时（本机统计）右侧显示该文本而非剩余百分比，且未配置上限时不渲染进度条
+    // 详情页窗口块：标题/重置、用量值、进度条分行显示，避免窄屏文字相互覆盖。
+    // value_text 非空时显示本机统计值，且未配置上限时不渲染进度条。
     void AddDetailBarBlock(lv_obj_t* parent, const char* title, int remaining_pct, int reset_seconds,
                            const std::string* value_text = nullptr) {
         auto font = PanelTextFont();
 
-        lv_obj_t* head = lv_obj_create(parent);
+        lv_obj_t* block = lv_obj_create(parent);
+        lv_obj_set_width(block, lv_pct(100));
+        lv_obj_set_height(block, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(block, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_opa(block, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(block, 8, 0);
+        lv_obj_set_style_border_width(block, 0, 0);
+        lv_obj_set_style_pad_all(block, 6, 0);
+        lv_obj_set_style_pad_row(block, 4, 0);
+        lv_obj_set_flex_flow(block, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(block, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* head = lv_obj_create(block);
         lv_obj_set_width(head, lv_pct(100));
-        lv_obj_set_height(head, LV_SIZE_CONTENT);
+        lv_obj_set_height(head, 20);
         lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(head, 0, 0);
         lv_obj_set_style_pad_all(head, 0, 0);
+        lv_obj_set_style_pad_column(head, 6, 0);
         lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(head, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
 
-        std::string left = title;
-        std::string reset = FormatResetShort(reset_seconds);
-        if (!reset.empty()) {
-            left += "  " + reset + "后重置";
-        }
         lv_obj_t* title_label = lv_label_create(head);
         lv_obj_set_style_text_font(title_label, font, 0);
-        lv_obj_set_style_text_color(title_label, lv_color_hex(0x9AA0A6), 0);
-        lv_label_set_text(title_label, left.c_str());
+        lv_obj_set_style_text_color(title_label, lv_color_hex(0xE8EAED), 0);
+        lv_obj_set_width(title_label, 0);
+        lv_obj_set_flex_grow(title_label, 1);
+        lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
+        lv_label_set_text(title_label, title);
 
-        lv_obj_t* pct_label = lv_label_create(head);
-        lv_obj_set_style_text_font(pct_label, font, 0);
+        std::string reset = FormatResetShort(reset_seconds);
+        if (!reset.empty()) {
+            lv_obj_t* reset_label = lv_label_create(head);
+            lv_obj_set_style_text_font(reset_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(reset_label, lv_color_hex(0x9AA0A6), 0);
+            lv_obj_set_width(reset_label, 88);
+            lv_obj_set_style_text_align(reset_label, LV_TEXT_ALIGN_RIGHT, 0);
+            lv_label_set_long_mode(reset_label, LV_LABEL_LONG_DOT);
+            lv_label_set_text(reset_label, (reset + " 后重置").c_str());
+        }
+
+        lv_obj_t* value_label = lv_label_create(block);
+        lv_obj_set_style_text_font(value_label, font, 0);
+        lv_obj_set_width(value_label, lv_pct(100));
+        lv_obj_set_style_text_align(value_label, LV_TEXT_ALIGN_RIGHT, 0);
         if (value_text != nullptr) {
-            lv_obj_set_style_text_color(pct_label, lv_color_hex(0xE8EAED), 0);
-            lv_label_set_text(pct_label, value_text->c_str());
+            lv_obj_set_style_text_color(value_label, lv_color_hex(0xE8EAED), 0);
+            lv_label_set_long_mode(value_label, LV_LABEL_LONG_WRAP);
+            lv_label_set_text(value_label, value_text->c_str());
         } else {
-            lv_obj_set_style_text_color(pct_label, UsageBarColor(remaining_pct), 0);
-            lv_label_set_text(pct_label,
+            lv_obj_set_height(value_label, 20);
+            lv_label_set_long_mode(value_label, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_color(value_label, UsageBarColor(remaining_pct), 0);
+            lv_label_set_text(value_label,
                               remaining_pct >= 0 ? (std::to_string(remaining_pct) + "% 剩余").c_str() : "查询失败");
         }
 
@@ -1878,7 +1927,7 @@ private:
         if (value_text != nullptr && remaining_pct < 0) {
             return;
         }
-        lv_obj_t* bar = lv_bar_create(parent);
+        lv_obj_t* bar = lv_bar_create(block);
         lv_obj_set_width(bar, lv_pct(100));
         lv_obj_set_height(bar, 14);
         lv_bar_set_range(bar, 0, 100);
@@ -1942,6 +1991,8 @@ private:
         lv_obj_set_style_text_font(label, font, 0);
         lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
         lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_line_space(label, 2, 0);
         lv_label_set_text(label, text.c_str());
     }
 
@@ -1963,12 +2014,16 @@ private:
         lv_obj_set_style_text_font(name_label, font, 0);
         lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
         lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_label, 0);
         lv_obj_set_flex_grow(name_label, 1);
         lv_label_set_text(name_label, name.c_str());
 
         lv_obj_t* value_label = lv_label_create(row);
         lv_obj_set_style_text_font(value_label, font, 0);
         lv_obj_set_style_text_color(value_label, lv_color_hex(0x9AA0A6), 0);
+        lv_obj_set_width(value_label, 96);
+        lv_obj_set_style_text_align(value_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(value_label, LV_LABEL_LONG_DOT);
         lv_label_set_text(value_label, value.c_str());
     }
 
@@ -1983,8 +2038,8 @@ private:
         const AccountDetail& acc = CurrentDetails()[index];
 
         std::string nav = "< " + std::to_string(index + 1) + "/" + std::to_string(CurrentDetails().size()) +
-                         " >  音量键切换 · M键返回";
-        lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str(), false);
+                         " >  L/R切换  M返回";
+        lv_obj_t* content = CreateUsagePanelBase("账号详情", nav.c_str(), true);
         if (content == nullptr) {
             GetDisplay()->ShowNotification("详情页创建失败", 3000);
             return;
@@ -2009,6 +2064,7 @@ private:
         lv_obj_set_style_text_font(email_label, font, 0);
         lv_obj_set_style_text_color(email_label, lv_color_hex(0xE8EAED), 0);
         lv_label_set_long_mode(email_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(email_label, 0);
         lv_obj_set_flex_grow(email_label, 1);
         lv_label_set_text(email_label, acc.email.empty() ? acc.name.c_str() : acc.email.c_str());
 
@@ -2017,13 +2073,13 @@ private:
             uint32_t plan_bg = 0;
             PlanBadgeColors(acc.plan, plan_text, plan_bg);
             lv_obj_t* plan_label = lv_label_create(title_row);
-            lv_obj_set_style_text_font(plan_label, font, 0);
+            lv_obj_set_style_text_font(plan_label, PanelSmallFont(), 0);
             lv_obj_set_style_text_color(plan_label, lv_color_hex(plan_text), 0);
             lv_obj_set_style_bg_color(plan_label, lv_color_hex(plan_bg), 0);
             lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
             lv_obj_set_style_radius(plan_label, 6, 0);
-            lv_obj_set_style_pad_hor(plan_label, 8, 0);
-            lv_obj_set_style_pad_ver(plan_label, 2, 0);
+            lv_obj_set_style_pad_hor(plan_label, 5, 0);
+            lv_obj_set_style_pad_ver(plan_label, 1, 0);
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
@@ -2146,7 +2202,7 @@ private:
         StartUsagePanelWatchdog();
     }
 
-    // 每页卡片数按源区分：官方账号 3 张/页；本机统计卡更高（三行数据），2 台/页
+    // 240x320 屏幕的两种数据源均固定每页 2 条
     int UsageCardsPerPage() const {
         return usage_source_ == kUsageSourceLocal ? kLocalCardsPerPage : kUsageCardsPerPage;
     }
@@ -2155,7 +2211,7 @@ private:
         return ((int)CurrentDetails().size() + UsageCardsPerPage() - 1) / UsageCardsPerPage();
     }
 
-    // 列表页：当前页的 3 张卡片完整显示（不滚动）+ 页码导航行。
+    // 列表页：当前页的 2 张卡片完整显示（不滚动）+ 页码导航行。
     // 标题按源区分（AI 用量 / 本地用量）；Q 键提示受 14px 小字库限制：
     // 本机组用已有汉字"Q关闭"，官方组用 ASCII "Q Local"（Local=本地统计）
     void ShowUsageListPage() {
