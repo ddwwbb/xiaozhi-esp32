@@ -781,15 +781,36 @@ private:
         return true;
     }
 
+    // 去除首尾空白（空格/制表/换行）——从网页复制粘贴的 Key/地址常带尾随换行，
+    // 会被字符校验误判无效
+    static void TrimSpaces(std::string& s) {
+        size_t begin = s.find_first_not_of(" \t\r\n");
+        size_t end = s.find_last_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            s.clear();
+            return;
+        }
+        s = s.substr(begin, end - begin + 1);
+    }
+
     static esp_err_t UsageConfigZhipuImportHandler(httpd_req_t* req) {
-        char body[512] = {0};
+        char body[1024] = {0};
         size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
-        int received = httpd_req_recv(req, body, total);
+        // TCP 分段时一次 recv 可能只收到部分 body，循环读满
+        int received = 0;
+        while (received < (int)total) {
+            int n = httpd_req_recv(req, body + received, total - received);
+            if (n <= 0) {
+                break;
+            }
+            received += n;
+        }
         if (received <= 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
             return ESP_FAIL;
         }
-        std::string key = GetFormField(body, "zhipu_key");
+        std::string key = GetFormField(std::string(body, received), "zhipu_key");
+        TrimSpaces(key);
 
         cJSON* root = cJSON_Parse(key.c_str());
         if (root != nullptr) {
@@ -864,14 +885,23 @@ private:
     static esp_err_t UsageConfigLocalAddHandler(httpd_req_t* req) {
         char body[384] = {0};
         size_t total = req->content_len < sizeof(body) - 1 ? req->content_len : sizeof(body) - 1;
-        int received = httpd_req_recv(req, body, total);
+        int received = 0;
+        while (received < (int)total) {
+            int n = httpd_req_recv(req, body + received, total - received);
+            if (n <= 0) {
+                break;
+            }
+            received += n;
+        }
         if (received <= 0) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
             return ESP_FAIL;
         }
-        std::string host = GetFormField(body, "host");
-        int port = atoi(GetFormField(body, "port").c_str());
-        std::string key = GetFormField(body, "key");
+        std::string host = GetFormField(std::string(body, received), "host");
+        int port = atoi(GetFormField(std::string(body, received), "port").c_str());
+        std::string key = GetFormField(std::string(body, received), "key");
+        TrimSpaces(host);
+        TrimSpaces(key);
         if (key.empty() || ValidLocalKey(key)) {
             if (port <= 0 || port >= 65536) {
                 port = 3939;
