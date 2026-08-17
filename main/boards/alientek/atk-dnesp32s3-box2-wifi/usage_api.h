@@ -42,11 +42,16 @@ struct AccountDetail {
     long long peak_daily_tokens = -1;
     long current_streak_days = -1;
     int reset_credits = -1;  // 可用限额重置积分
-    int remaining_5h = -1;
-    int remaining_weekly = -1;
-    int remaining_cr = -1;  // 代码审查窗口
+    // 窗口用量统一为"已用百分比"（与 cc-switch 的 utilization 一致）。
+    // 窗口身份按 limit_window_seconds 识别，不按 primary/secondary 位置：
+    // 免费与 prolite 套餐的次窗口是 30 天而非每周
+    int used_5h = -1;
+    int used_weekly = -1;
+    int used_monthly = -1;  // 30 天窗口（免费/prolite 次窗口）
+    int used_cr = -1;       // 代码审查窗口
     int reset_5h = -1;
     int reset_weekly = -1;
+    int reset_monthly = -1;
     int reset_cr = -1;
     std::string account_id;  // 查询时需要
     // ---- 本机统计（PC 端 box2-usage-server），无官方配额概念 ----

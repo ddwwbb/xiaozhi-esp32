@@ -24,35 +24,39 @@
 
 namespace usage {
 
-// 窗口剩余百分比：优先 used_percent，退回 remaining_count/total_count；未知返回 -1
-int WindowRemainingPct(cJSON* window) {
+// 窗口已用百分比：优先 used_percent（官方按整数下发，按浮点容错解析），
+// 退回 remaining_count/total_count 换算；未知返回 -1
+int WindowUsedPct(cJSON* window) {
     if (window == nullptr) {
         return -1;
     }
     cJSON* used = cJSON_GetObjectItem(window, "used_percent");
     if (cJSON_IsNumber(used)) {
-        int remaining = 100 - used->valueint;
-        return remaining < 0 ? 0 : (remaining > 100 ? 100 : remaining);
+        int pct = (int)(used->valuedouble + 0.5);
+        return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
     }
     cJSON* remaining = cJSON_GetObjectItem(window, "remaining_count");
     cJSON* total = cJSON_GetObjectItem(window, "total_count");
     if (cJSON_IsNumber(remaining) && cJSON_IsNumber(total) && total->valueint > 0) {
-        return remaining->valueint * 100 / total->valueint;
+        int pct = 100 - remaining->valueint * 100 / total->valueint;
+        return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
     }
     return -1;
 }
 
+// 重置倒计时秒数：优先绝对时间 reset_at（Unix 秒），缺失时用相对 reset_after_seconds
 int WindowResetSeconds(cJSON* window) {
     if (window == nullptr) {
         return -1;
     }
+    cJSON* at = cJSON_GetObjectItem(window, "reset_at");
+    if (cJSON_IsNumber(at) && at->valuedouble > 0) {
+        int seconds = (int)at->valuedouble - (int)time(nullptr);
+        return seconds > 0 ? seconds : -1;
+    }
     cJSON* after = cJSON_GetObjectItem(window, "reset_after_seconds");
     if (cJSON_IsNumber(after) && after->valueint > 0) {
         return after->valueint;
-    }
-    cJSON* at = cJSON_GetObjectItem(window, "reset_at");
-    if (cJSON_IsNumber(at) && at->valueint > 0) {
-        return at->valueint - (int)time(nullptr);
     }
     return -1;
 }
@@ -694,15 +698,49 @@ int DirectFetchUsage(const std::string& access_token, const std::string& account
     cJSON* secondary = rate_limit ? cJSON_GetObjectItem(rate_limit, "secondary_window") : nullptr;
     cJSON* cr_limit = cJSON_GetObjectItem(usage, "code_review_rate_limit");
     cJSON* cr_primary = cr_limit ? cJSON_GetObjectItem(cr_limit, "primary_window") : nullptr;
-    acc.remaining_5h = WindowRemainingPct(primary);
-    acc.remaining_weekly = WindowRemainingPct(secondary);
-    acc.remaining_cr = WindowRemainingPct(cr_primary);
-    acc.reset_5h = WindowResetSeconds(primary);
-    acc.reset_weekly = WindowResetSeconds(secondary);
+    // 窗口语义按 limit_window_seconds 识别（codex TUI 与 cc-switch 同款做法，±5% 容差）：
+    // 18000=5 小时、604800=每周、2592000=30 天（免费/prolite 的次窗口）。
+    // primary/secondary 只是主次位置，不保证对应 5h/周，按位置归类会把 30 天窗口错标成"周"
+    auto apply_window = [&](cJSON* window, bool primary_slot) {
+        if (window == nullptr) {
+            return;
+        }
+        int used_pct = WindowUsedPct(window);
+        if (used_pct < 0) {
+            return;
+        }
+        int reset = WindowResetSeconds(window);
+        cJSON* secs = cJSON_GetObjectItem(window, "limit_window_seconds");
+        long window_seconds = cJSON_IsNumber(secs) ? (long)secs->valuedouble : 0;
+        auto near = [&](long target) {
+            long tolerance = target / 20;
+            return window_seconds > target - tolerance && window_seconds < target + tolerance;
+        };
+        if (near(18000)) {
+            acc.used_5h = used_pct;
+            acc.reset_5h = reset;
+        } else if (near(604800)) {
+            acc.used_weekly = used_pct;
+            acc.reset_weekly = reset;
+        } else if (near(2592000)) {
+            acc.used_monthly = used_pct;
+            acc.reset_monthly = reset;
+        } else if (primary_slot && acc.used_5h < 0) {
+            // 未知窗口时长：回退按位置（codex TUI 的 fallback 同理），只在槽位空闲时占位
+            acc.used_5h = used_pct;
+            acc.reset_5h = reset;
+        } else if (!primary_slot && acc.used_weekly < 0) {
+            acc.used_weekly = used_pct;
+            acc.reset_weekly = reset;
+        }
+    };
+    apply_window(primary, true);
+    apply_window(secondary, false);
+    acc.used_cr = WindowUsedPct(cr_primary);
     acc.reset_cr = WindowResetSeconds(cr_primary);
     cJSON_Delete(usage);
-    ESP_LOGI(TAG, "Direct usage: %s 5h=%d%% weekly=%d%% cr=%d%%",
-             acc.name.c_str(), acc.remaining_5h, acc.remaining_weekly, acc.remaining_cr);
+    ESP_LOGI(TAG, "Direct usage: %s 5h=%d%% weekly=%d%% monthly=%d%% cr=%d%%",
+             acc.name.c_str(), acc.used_5h, acc.used_weekly, acc.used_monthly, acc.used_cr);
     return 200;
 }
 
@@ -763,12 +801,12 @@ void ApplyZhipuLimit(cJSON* limit_item, int unit_value, AccountDetail& acc) {
     if (!cJSON_IsNumber(pct)) {
         return;
     }
-    int remaining = 100 - (int)(pct->valuedouble + 0.5);
-    if (remaining < 0) {
-        remaining = 0;
+    int used = (int)(pct->valuedouble + 0.5);
+    if (used < 0) {
+        used = 0;
     }
-    if (remaining > 100) {
-        remaining = 100;
+    if (used > 100) {
+        used = 100;
     }
     int reset = -1;
     cJSON* next_reset = cJSON_GetObjectItem(limit_item, "nextResetTime");
@@ -778,11 +816,11 @@ void ApplyZhipuLimit(cJSON* limit_item, int unit_value, AccountDetail& acc) {
             reset = -1;
         }
     }
-    if (unit_value == 3 && acc.remaining_5h < 0) {
-        acc.remaining_5h = remaining;
+    if (unit_value == 3 && acc.used_5h < 0) {
+        acc.used_5h = used;
         acc.reset_5h = reset;
-    } else if (unit_value == 6 && acc.remaining_weekly < 0) {
-        acc.remaining_weekly = remaining;
+    } else if (unit_value == 6 && acc.used_weekly < 0) {
+        acc.used_weekly = used;
         acc.reset_weekly = reset;
     }
 }
@@ -862,19 +900,26 @@ int FetchZhipuUsage(const std::string& api_key, AccountDetail& acc, const Socks5
             cJSON* next_reset = cJSON_GetObjectItem(item, "nextResetTime");
             return cJSON_IsNumber(next_reset) ? (long long)next_reset->valuedouble : -1;
         };
-        if (reset_ms(fallback[1]) < reset_ms(fallback[0])) {
+        // 无 reset 的条目优先归 5h（5h 桶 0% 时可能没有 nextResetTime）；
+        // 都有 reset 时按时间升序——周期末尾每周窗口可能比 5h 更早重置，
+        // 不能按"晚重置=周窗"推断（cc-switch #3036 实证会标反）
+        if ((reset_ms(fallback[0]) >= 0) == (reset_ms(fallback[1]) >= 0)) {
+            if (reset_ms(fallback[1]) != -1 && reset_ms(fallback[1]) < reset_ms(fallback[0])) {
+                std::swap(fallback[0], fallback[1]);
+            }
+        } else if (reset_ms(fallback[0]) >= 0) {
             std::swap(fallback[0], fallback[1]);
         }
     }
     // 兜底条目按序填入仍空缺的槽位（5h 优先，其次周窗）：
     // 显式 unit 已占住 5h 时，剩余条目应落周窗而非被丢弃
     for (int i = 0; i < fallback_count; i++) {
-        ApplyZhipuLimit(fallback[i], acc.remaining_5h < 0 ? 3 : 6, acc);
+        ApplyZhipuLimit(fallback[i], acc.used_5h < 0 ? 3 : 6, acc);
     }
 
     cJSON_Delete(root);
     ESP_LOGI(TAG, "Zhipu usage: %s 5h=%d%% weekly=%d%%",
-             acc.name.c_str(), acc.remaining_5h, acc.remaining_weekly);
+             acc.name.c_str(), acc.used_5h, acc.used_weekly);
     return 200;
 }
 
