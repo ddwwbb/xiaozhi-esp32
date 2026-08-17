@@ -205,11 +205,16 @@ esp_err_t Ota::CheckVersion() {
             // 设置系统时间
             struct timeval tv;
             double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+
+            // 时区写死为中国 UTC+8：服务器按出口 IP 定位时区，代理/跨境线路
+            // 会拿到偏 1 小时以上的 timezone_offset，设备端不再采信该值
+            constexpr int kTimezoneOffsetMinutes = 8 * 60;
+            if (cJSON_IsNumber(timezone_offset) &&
+                timezone_offset->valueint != kTimezoneOffsetMinutes) {
+                ESP_LOGW(TAG, "Server timezone_offset %d ignored, using UTC+8",
+                         timezone_offset->valueint);
             }
+            ts += (kTimezoneOffsetMinutes * 60 * 1000); // 转换分钟为毫秒
             
             tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
             tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
