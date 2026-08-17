@@ -72,6 +72,8 @@ private:
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
     std::atomic<bool> usage_fetching_{false};
+    // StartUsageQuery 参数经成员传入查询任务（xTaskCreate 无参捕获）
+    bool usage_query_keep_source_ = false;
     // XIO_KEY_Q 有效电平无原理图依据（L 键低有效、M 键高有效），上电按空闲电平推断
     bool q_key_active_high_ = true;
     // 长按 Q 进入的配置模式：临时 HTTP 页面把用量查询配置写入 NVS
@@ -188,10 +190,6 @@ private:
     esp_timer_handle_t usage_loading_timer_ = nullptr;
     lv_obj_t* loading_label_ = nullptr;
     int loading_dots_ = 0;
-    // 详情页账号信息模块（14px 小字体，固定高度）：内容超高时自动循环滚动（无触摸屏）
-    lv_obj_t* info_card_ = nullptr;
-    lv_timer_t* info_scroll_timer_ = nullptr;
-    int info_scroll_hold_ = 0;
     // 自动刷新后恢复位置（源 + 详情索引，-1=列表页）
     int pending_restore_source_ = -1;
     int pending_detail_restore_ = -1;
@@ -1323,14 +1321,17 @@ form.inline{margin:0}
         ESP_LOGI(TAG, "Usage config mode: http://%s/", ip.c_str());
     }
 
-    // 用导入的令牌直连官方接口查询用量并展示（ChatGPT 账号 + 智谱 API Key）
-    void StartUsageQuery() {
+    // 用导入的令牌直连官方接口查询用量并展示（ChatGPT 账号 + 智谱 API Key）。
+    // keep_source=true（自动刷新）回到刷新前的源与页面；false（用户主动按 Q）
+    // 走初始源（官方查询成功优先官方面板），避免被上一次所在面板锁死
+    void StartUsageQuery(bool keep_source = false) {
         if (usage_fetching_.exchange(true)) {
             return;
         }
+        usage_query_keep_source_ = keep_source;
         if (xTaskCreate([](void* arg) {
                 auto self = static_cast<atk_dnesp32s3_box2_wifi*>(arg);
-                self->QueryUsage();
+                self->QueryUsage(self->usage_query_keep_source_);
                 self->usage_fetching_ = false;
                 vTaskDelete(nullptr);
             }, "usage_query", 10240, this, 4, nullptr) != pdPASS) {
@@ -1479,9 +1480,14 @@ form.inline{margin:0}
         ShowUsageListPanel(std::move(api_details), std::move(local_details), api_ok, local_ok);
     }
 
-    void QueryUsage() {
-        pending_restore_source_ = usage_source_;
-        pending_detail_restore_ = CurrentDetailIndex();
+    void QueryUsage(bool keep_source = false) {
+        if (keep_source) {
+            pending_restore_source_ = usage_source_;
+            pending_detail_restore_ = CurrentDetailIndex();
+        } else {
+            pending_restore_source_ = -1;
+            pending_detail_restore_ = -1;
+        }
         if (LoadDirectAuthJsons().empty() && LoadZhipuKeys().empty() && LoadLocalUsages().empty()) {
             GetDisplay()->ShowNotification("未导入令牌,长按Q键配置", 3000);
             return;
@@ -1496,19 +1502,37 @@ form.inline{margin:0}
     }
 
 
-    static void PlanBadgeColors(const std::string& plan, uint32_t& text, uint32_t& bg) {
+    // v2 面板配色：底/卡/描边/强调（青），语义色与徽章色沿用
+    static constexpr uint32_t kPanelBg = 0x0C0F13;
+    static constexpr uint32_t kPanelCard = 0x171C24;
+    static constexpr uint32_t kPanelLine = 0x252C37;
+    static constexpr uint32_t kPanelCyan = 0x35D0E8;
+    static constexpr uint32_t kPanelCyanDark = 0x2E6E7E;
+    static constexpr uint32_t kPanelCyanLight = 0x7FE8F5;
+
+    // 套餐徽章三色（描边标签风格）：亮字 + 深底 + 同色 1px 描边，深色卡上边缘清晰
+    static void PlanBadgeColors(const std::string& plan, uint32_t& text, uint32_t& bg, uint32_t& border) {
         if (strcasecmp(plan.c_str(), "pro") == 0) {
-            text = 0xD7A9FF;
-            bg = 0x3A2A4D;
-        } else if (strcasecmp(plan.c_str(), "team") == 0 || strcasecmp(plan.c_str(), "business") == 0) {
-            text = 0xFDD663;
-            bg = 0x443B1E;
+            text = 0xE5CEFF;
+            bg = 0x2A1F38;
+            border = 0x9B6BD4;
+        } else if (strcasecmp(plan.c_str(), "team") == 0 || strcasecmp(plan.c_str(), "business") == 0 ||
+                   strcasecmp(plan.c_str(), "lite") == 0) {
+            text = 0xFFE38A;
+            bg = 0x3A3117;
+            border = 0xC9A227;
+        } else if (plan == "本地") {
+            text = 0x8FE9F7;
+            bg = 0x0E2E36;
+            border = 0x2E9DB2;
         } else if (strcasecmp(plan.c_str(), "free") == 0) {
-            text = 0x9AA0A6;
-            bg = 0x26292E;
+            text = 0xC7CDD6;
+            bg = 0x232830;
+            border = 0x6B7684;
         } else {  // plus 及未知
-            text = 0x8AB4F8;
-            bg = 0x283142;
+            text = 0xB7D0FF;
+            bg = 0x1F2C42;
+            border = 0x5F8BDC;
         }
     }
 
@@ -1585,17 +1609,12 @@ form.inline{margin:0}
             esp_timer_stop(usage_loading_timer_);
         }
         loading_label_ = nullptr;
-        info_card_ = nullptr;
         api_detail_index_ = -1;
         local_detail_index_ = -1;
         if (usage_panel_ == nullptr) {
             return;
         }
         DisplayLockGuard lock(GetDisplay());
-        if (info_scroll_timer_ != nullptr) {
-            lv_timer_delete(info_scroll_timer_);
-            info_scroll_timer_ = nullptr;
-        }
         lv_obj_delete(usage_panel_);
         usage_panel_ = nullptr;
     }
@@ -1630,7 +1649,7 @@ form.inline{margin:0}
             esp_timer_create_args_t refresh_args = {
                 .callback = [](void* arg) {
                     if (instance_->usage_panel_ != nullptr) {
-                        instance_->StartUsageQuery();
+                        instance_->StartUsageQuery(true);
                     }
                 },
                 .arg = nullptr,
@@ -1716,7 +1735,7 @@ form.inline{margin:0}
         lv_obj_set_size(usage_panel_, LV_HOR_RES, LV_VER_RES);
         lv_obj_add_flag(usage_panel_, LV_OBJ_FLAG_FLOATING);
         lv_obj_move_foreground(usage_panel_);
-        lv_obj_set_style_bg_color(usage_panel_, lv_color_hex(0x101418), 0);
+        lv_obj_set_style_bg_color(usage_panel_, lv_color_hex(kPanelBg), 0);
         lv_obj_set_style_bg_opa(usage_panel_, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(usage_panel_, 0, 0);
         lv_obj_set_style_border_width(usage_panel_, 0, 0);
@@ -1726,7 +1745,7 @@ form.inline{margin:0}
         lv_obj_clear_flag(usage_panel_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_text_font(usage_panel_, font, 0);
 
-        // 标题行：左标题，右侧页码 + 数据时间戳
+        // 标题行：青色状态灯 + 左标题，右侧页码 + 数据时间戳
         lv_obj_t* header_row = lv_obj_create(usage_panel_);
         lv_obj_set_width(header_row, lv_pct(100));
         lv_obj_set_height(header_row, LV_SIZE_CONTENT);
@@ -1737,6 +1756,15 @@ form.inline{margin:0}
         lv_obj_set_style_pad_column(header_row, 6, 0);
         lv_obj_set_flex_align(header_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(header_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* lamp = lv_obj_create(header_row);
+        lv_obj_set_size(lamp, 8, 8);
+        lv_obj_set_style_bg_color(lamp, lv_color_hex(kPanelCyan), 0);
+        lv_obj_set_style_bg_opa(lamp, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(lamp, 2, 0);
+        lv_obj_set_style_border_width(lamp, 0, 0);
+        lv_obj_set_style_pad_all(lamp, 0, 0);
+        lv_obj_clear_flag(lamp, LV_OBJ_FLAG_SCROLLABLE);
 
         // 标题行：标题 + 页码紧跟其后（内容宽），弹簧占位把刷新时间推到右侧
         lv_obj_t* header = lv_label_create(header_row);
@@ -1781,89 +1809,130 @@ form.inline{margin:0}
         return content;
     }
 
-    // 单行窗口用量行：类型(重置倒计时) + 进度条，百分比文本直接画在条内。
-    // 百分比与填充均为"已用"语义（cc-switch 同款）；主字体（"已/用"不在 14px 小字库）。
-    // 列表卡片与详情页共用
-    void AddUsageWindowRow(lv_obj_t* parent, const std::string& type, int used_pct, int reset_seconds) {
-        auto font = PanelTextFont();
-
-        lv_obj_t* row = lv_obj_create(parent);
-        lv_obj_set_width(row, lv_pct(100));
-        lv_obj_set_height(row, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_set_style_pad_column(row, 6, 0);
-        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-        // 左侧"类型 + (重置时刻)"：类型 20px 主字体，重置时刻 14px 小字体灰色；
-        // 组合超宽时换行（如"代码审查(21日14:35)"）
-        lv_obj_t* left = lv_obj_create(row);
-        lv_obj_set_width(left, 144);
-        lv_obj_set_height(left, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(left, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(left, 0, 0);
-        lv_obj_set_style_pad_all(left, 0, 0);
-        lv_obj_set_style_pad_column(left, 2, 0);
-        lv_obj_set_flex_flow(left, LV_FLEX_FLOW_ROW_WRAP);
-        lv_obj_set_flex_align(left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(left, LV_OBJ_FLAG_SCROLLABLE);
-
-        std::string label = type;
-        lv_obj_t* type_label = lv_label_create(left);
-        lv_obj_set_style_text_font(type_label, font, 0);
-        lv_obj_set_style_text_color(type_label, lv_color_hex(0xE8EAED), 0);
-        lv_label_set_text(type_label, label.c_str());
-
-        // 重置时刻（时钟时间）：当天内显示 hh:mm，跨天（周/30天窗口）带日期 dd日hh:mm。
-        // 依赖系统时间联网同步
-        if (reset_seconds > 0) {
-            time_t now = time(nullptr);
-            time_t reset_at = now + reset_seconds;
-            struct tm tm_reset;
-            struct tm tm_now;
-            localtime_r(&reset_at, &tm_reset);
-            localtime_r(&now, &tm_now);
-            char time_buf[20];
-            if (tm_reset.tm_yday == tm_now.tm_yday && tm_reset.tm_year == tm_now.tm_year) {
-                strftime(time_buf, sizeof(time_buf), "(%H:%M)", &tm_reset);
-            } else {
-                strftime(time_buf, sizeof(time_buf), "(%d日%H:%M)", &tm_reset);
-            }
-            lv_obj_t* time_label = lv_label_create(left);
-            lv_obj_set_style_text_font(time_label, PanelSmallFont(), 0);
-            lv_obj_set_style_text_color(time_label, lv_color_hex(0x9AA0A6), 0);
-            lv_label_set_text(time_label, time_buf);
+    // 重置时刻（时钟）：当天显示 hh:mm，跨天带月日（如 8月21日 14:35）；依赖联网时间同步
+    static std::string FormatResetClock(int seconds) {
+        if (seconds <= 0) {
+            return "";
         }
-
-        lv_obj_t* bar = lv_bar_create(row);
-        lv_obj_set_height(bar, 24);
-        lv_obj_set_flex_grow(bar, 1);
-        lv_bar_set_range(bar, 0, 100);
-        lv_bar_set_value(bar, used_pct >= 0 ? used_pct : 0, LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(0x2A2F36), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(bar, UsageBarColor(used_pct), LV_PART_INDICATOR);
-        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-        lv_obj_set_style_radius(bar, 12, LV_PART_MAIN);
-        lv_obj_set_style_radius(bar, 12, LV_PART_INDICATOR);
-
-        // 百分比画在进度条内（14px 小字体保证完整显示）：标签作为 bar 子对象居中。
-        // 白字直接压黄/橙填充对比约 2:1 不达标，加暗色半透明药丸底衬后
-        // 在绿/黄/红填充与深色轨道上均可读
-        lv_obj_t* pct_label = lv_label_create(bar);
-        lv_obj_set_style_text_font(pct_label, PanelSmallFont(), 0);
-        lv_obj_set_style_text_color(pct_label, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_bg_color(pct_label, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_bg_opa(pct_label, LV_OPA_40, 0);
-        lv_obj_set_style_radius(pct_label, 7, 0);
-        lv_obj_set_style_pad_hor(pct_label, 6, 0);
-        lv_obj_center(pct_label);
-        lv_label_set_text(pct_label, used_pct >= 0 ? ("已用" + std::to_string(used_pct) + "%").c_str() : "?");
+        time_t now = time(nullptr);
+        time_t reset_at = now + seconds;
+        struct tm tm_reset;
+        struct tm tm_now;
+        localtime_r(&reset_at, &tm_reset);
+        localtime_r(&now, &tm_now);
+        char time_buf[56];
+        if (tm_reset.tm_yday == tm_now.tm_yday && tm_reset.tm_year == tm_now.tm_year) {
+            strftime(time_buf, sizeof(time_buf), "%H:%M", &tm_reset);
+        } else {
+            snprintf(time_buf, sizeof(time_buf), "%d月%d日 %02d:%02d",
+                     tm_reset.tm_mon + 1, tm_reset.tm_mday, tm_reset.tm_hour, tm_reset.tm_min);
+        }
+        return time_buf;
     }
 
+    // 分段刻度条：n 段等宽，点亮段数四舍五入，颜色按已用百分比分级（cc-switch 阈值）。
+    // grow=true 用于横向 flex 父容器（与百分比同行分享宽度）；
+    // grow=false 用于纵向 flex 父容器（双卡），宽度撑满——否则 flex_grow 会变成纵向伸展
+    void AddSegBar(lv_obj_t* parent, int used_pct, int nsegs, bool grow) {
+        lv_obj_t* bar = lv_obj_create(parent);
+        if (grow) {
+            lv_obj_set_width(bar, 0);
+            lv_obj_set_flex_grow(bar, 1);
+        } else {
+            lv_obj_set_width(bar, lv_pct(100));
+        }
+        lv_obj_set_height(bar, 12);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(bar, 0, 0);
+        lv_obj_set_style_pad_all(bar, 0, 0);
+        lv_obj_set_style_pad_column(bar, 2, 0);
+        lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_color_t on_color = UsageBarColor(used_pct);
+        int lit = used_pct >= 0 ? (used_pct * nsegs + 50) / 100 : 0;
+        for (int i = 0; i < nsegs; i++) {
+            lv_obj_t* seg = lv_obj_create(bar);
+            lv_obj_set_width(seg, 0);
+            lv_obj_set_flex_grow(seg, 1);
+            lv_obj_set_height(seg, 12);
+            lv_obj_set_style_bg_color(seg, i < lit ? on_color : lv_color_hex(kPanelLine), 0);
+            lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(seg, 2, 0);
+            lv_obj_set_style_border_width(seg, 0, 0);
+            lv_obj_set_style_pad_all(seg, 0, 0);
+            lv_obj_clear_flag(seg, LV_OBJ_FLAG_SCROLLABLE);
+        }
+    }
+
+    // 列表卡窗口块（两行）：上 = 类型 20px + 重置时刻 14px 灰（右），
+    // 下 = 10 段刻度条 + 20px 语义色大百分比（右对齐，卡片第一视觉层级）。
+    // 查询失败显示 "--" 与空轨道
+    void AddUsageWindowRow(lv_obj_t* parent, const std::string& type, int used_pct, int reset_seconds) {
+        lv_obj_t* win = lv_obj_create(parent);
+        lv_obj_set_width(win, lv_pct(100));
+        lv_obj_set_height(win, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(win, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(win, 0, 0);
+        lv_obj_set_style_pad_all(win, 0, 0);
+        lv_obj_set_style_pad_row(win, 3, 0);
+        lv_obj_set_flex_flow(win, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(win, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* top = lv_obj_create(win);
+        lv_obj_set_width(top, lv_pct(100));
+        lv_obj_set_height(top, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(top, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(top, 0, 0);
+        lv_obj_set_style_pad_all(top, 0, 0);
+        lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* type_label = lv_label_create(top);
+        lv_obj_set_style_text_font(type_label, PanelTextFont(), 0);
+        lv_obj_set_style_text_color(type_label, lv_color_hex(0xE8EAED), 0);
+        lv_label_set_text(type_label, type.c_str());
+
+        std::string clock = FormatResetClock(reset_seconds);
+        if (!clock.empty()) {
+            lv_obj_t* spacer = lv_obj_create(top);
+            lv_obj_set_width(spacer, 0);
+            lv_obj_set_flex_grow(spacer, 1);
+            lv_obj_set_height(spacer, 1);
+            lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(spacer, 0, 0);
+            lv_obj_set_style_pad_all(spacer, 0, 0);
+            lv_obj_t* clock_label = lv_label_create(top);
+            lv_obj_set_style_text_font(clock_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(clock_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(clock_label, clock.c_str());
+        }
+
+        lv_obj_t* main = lv_obj_create(win);
+        lv_obj_set_width(main, lv_pct(100));
+        lv_obj_set_height(main, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(main, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(main, 0, 0);
+        lv_obj_set_style_pad_all(main, 0, 0);
+        lv_obj_set_style_pad_column(main, 6, 0);
+        lv_obj_set_flex_flow(main, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(main, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(main, LV_OBJ_FLAG_SCROLLABLE);
+
+        AddSegBar(main, used_pct, 10, true);
+
+        lv_obj_t* pct_label = lv_label_create(main);
+        lv_obj_set_style_text_font(pct_label, PanelTextFont(), 0);
+        lv_obj_set_style_text_color(pct_label,
+                                    used_pct >= 0 ? UsageBarColor(used_pct) : lv_color_hex(0x9AA0A6), 0);
+        lv_obj_set_width(pct_label, 50);
+        lv_obj_set_style_text_align(pct_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(pct_label, used_pct >= 0 ? (std::to_string(used_pct) + "%").c_str() : "--");
+    }
+
+    // 列表卡（v2 仪表风）：左侧 3px 健康竖条一眼分级（最紧窗口语义色/失败红/本机青）。
+    // 官方卡 = 名字+套餐徽章 + 窗口块（5小时 + 每周，免费套餐次窗口为 30日）；
+    // 本机卡 = 名字+本地徽章 + 倒计时行 + 日/周/累计三行数值；失败卡显示提示与空轨道
     void AddUsageCard(lv_obj_t* parent, const AccountDetail& acc) {
         auto font = PanelTextFont();
 
@@ -1872,19 +1941,45 @@ form.inline{margin:0}
         // 卡片弹性填满整页可用高度（每页固定 2 张），内容纵向均匀分布不留大片空白
         lv_obj_set_height(card, 0);
         lv_obj_set_flex_grow(card, 1);
-        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(kPanelCard), 0);
         lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(card, 10, 0);
-        lv_obj_set_style_border_width(card, 0, 0);
-        lv_obj_set_style_pad_all(card, 8, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(kPanelLine), 0);
+        lv_obj_set_style_pad_top(card, 6, 0);
+        lv_obj_set_style_pad_bottom(card, 6, 0);
+        lv_obj_set_style_pad_left(card, 11, 0);
+        lv_obj_set_style_pad_right(card, 8, 0);
         lv_obj_set_style_pad_row(card, 4, 0);
         lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
+        // 健康竖条：负偏移抵消 pad_left 贴到卡片左缘，高度按内容区百分比伸缩。
+        // 卡片是 flex 容器，必须 IGNORE_LAYOUT 脱离流式布局，否则 set_pos 无效
+        lv_obj_t* health = lv_obj_create(card);
+        lv_obj_add_flag(health, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_set_pos(health, -8, 8);
+        lv_obj_set_width(health, 3);
+        lv_obj_set_height(health, lv_pct(86));
+        lv_color_t health_color = lv_color_hex(kPanelCyan);
+        if (acc.unavailable) {
+            health_color = lv_color_hex(0xEA4335);
+        } else if (!acc.local_stats) {
+            int worst = std::max(acc.used_5h, std::max(acc.used_weekly, acc.used_monthly));
+            health_color = UsageBarColor(worst);
+        }
+        lv_obj_set_style_bg_color(health, health_color, 0);
+        lv_obj_set_style_bg_opa(health, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(health, 2, 0);
+        lv_obj_set_style_border_width(health, 0, 0);
+        lv_obj_set_style_pad_all(health, 0, 0);
+        lv_obj_clear_flag(health, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 标题行：名字 + 套餐/本地徽章
         lv_obj_t* title_row = lv_obj_create(card);
         lv_obj_set_width(title_row, lv_pct(100));
-        lv_obj_set_height(title_row, 22);
+        lv_obj_set_height(title_row, 24);
         lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(title_row, 0, 0);
         lv_obj_set_style_pad_all(title_row, 0, 0);
@@ -1905,21 +2000,33 @@ form.inline{margin:0}
         if (!acc.plan.empty()) {
             uint32_t text_color = 0;
             uint32_t bg_color = 0;
-            PlanBadgeColors(acc.plan, text_color, bg_color);
+            uint32_t border_color = 0;
+            PlanBadgeColors(acc.plan, text_color, bg_color, border_color);
             lv_obj_t* plan_label = lv_label_create(title_row);
             lv_obj_set_style_text_font(plan_label, PanelSmallFont(), 0);
             lv_obj_set_style_text_color(plan_label, lv_color_hex(text_color), 0);
             lv_obj_set_style_bg_color(plan_label, lv_color_hex(bg_color), 0);
             lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(plan_label, 6, 0);
+            lv_obj_set_style_border_width(plan_label, 1, 0);
+            lv_obj_set_style_border_color(plan_label, lv_color_hex(border_color), 0);
+            lv_obj_set_style_radius(plan_label, 4, 0);
             lv_obj_set_style_pad_hor(plan_label, 5, 0);
-            lv_obj_set_style_pad_ver(plan_label, 1, 0);
+            lv_obj_set_style_pad_ver(plan_label, 2, 0);
             lv_label_set_text(plan_label, acc.plan.c_str());
         }
 
-        // 倒计时行只保留给本机统计（到当日午夜）；官方账号的重置倒计时
-        // 已并入每个窗口行（类型后的圆括号）
+        // 本机统计卡片：倒计时行 + 当天/本周/累计三行（左 tag 右数值，一页两台 PC）。
+        // 数值 20px 主字体（万/亿 单位不在 14px 小字库），尾注 14px 灰
         if (acc.local_stats) {
+            if (acc.unavailable) {
+                lv_obj_t* dead_label = lv_label_create(card);
+                lv_obj_set_width(dead_label, lv_pct(100));
+                lv_obj_set_style_text_font(dead_label, PanelSmallFont(), 0);
+                lv_obj_set_style_text_color(dead_label, lv_color_hex(0x9AA0A6), 0);
+                lv_label_set_long_mode(dead_label, LV_LABEL_LONG_DOT);
+                lv_label_set_text(dead_label, "服务不可达 · 检查PC端服务");
+                return;
+            }
             std::string reset = FormatResetShort(acc.reset_5h);
             if (!reset.empty()) {
                 lv_obj_t* reset_label = lv_label_create(card);
@@ -1930,44 +2037,85 @@ form.inline{margin:0}
                 lv_label_set_long_mode(reset_label, LV_LABEL_LONG_DOT);
                 lv_label_set_text(reset_label, (reset + " 后重置").c_str());
             }
+            if (acc.today_tokens >= 0) {
+                auto add_row = [&](const char* tag, const std::string& value, const std::string& tail, bool dim) {
+                    lv_obj_t* row = lv_obj_create(card);
+                    lv_obj_set_width(row, lv_pct(100));
+                    lv_obj_set_height(row, LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+                    lv_obj_set_style_border_width(row, 0, 0);
+                    lv_obj_set_style_pad_all(row, 0, 0);
+                    lv_obj_set_style_pad_column(row, 6, 0);
+                    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+                    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+                    // 仪表式行：tag 紧跟主值(20px)，尾注(次数/费用)吃剩余宽度右对齐，超宽自动省略
+                    lv_obj_t* tag_label = lv_label_create(row);
+                    lv_obj_set_style_text_font(tag_label, font, 0);
+                    lv_obj_set_style_text_color(tag_label,
+                                                lv_color_hex(dim ? 0x9AA0A6 : kPanelCyan), 0);
+                    lv_label_set_text(tag_label, tag);
+
+                    lv_obj_t* value_label = lv_label_create(row);
+                    lv_obj_set_style_text_font(value_label, font, 0);
+                    lv_obj_set_style_text_color(value_label,
+                                                lv_color_hex(dim ? 0x9AA0A6 : 0xE8EAED), 0);
+                    lv_label_set_text(value_label, value.c_str());
+
+                    if (!tail.empty()) {
+                        lv_obj_t* tail_label = lv_label_create(row);
+                        lv_obj_set_style_text_font(tail_label, PanelSmallFont(), 0);
+                        lv_obj_set_style_text_color(tail_label, lv_color_hex(0x9AA0A6), 0);
+                        lv_obj_set_width(tail_label, 0);
+                        lv_obj_set_flex_grow(tail_label, 1);
+                        lv_obj_set_style_text_align(tail_label, LV_TEXT_ALIGN_RIGHT, 0);
+                        lv_label_set_long_mode(tail_label, LV_LABEL_LONG_DOT);
+                        lv_label_set_text(tail_label, tail.c_str());
+                    }
+                };
+                auto tail_text = [](int requests, double cost) {
+                    std::string cost_text = cost >= 0 ? usage::CostText(cost, true) : "";
+                    std::string tail;
+                    if (requests >= 0) {
+                        tail = std::to_string(requests) + "次";
+                    }
+                    if (!cost_text.empty()) {
+                        tail = tail.empty() ? cost_text : tail + " · " + cost_text;
+                    }
+                    return tail;
+                };
+                add_row("日", usage::FormatTokens(acc.today_tokens),
+                        tail_text(acc.requests, acc.today_cost), false);
+                add_row("周", usage::FormatTokens(acc.week_tokens),
+                        tail_text(acc.week_requests, acc.week_cost), false);
+                add_row("累", usage::FormatTokens(acc.lifetime_tokens),
+                        acc.lifetime_cost >= 0 ? usage::CostText(acc.lifetime_cost, true) : "", true);
+            }
         }
 
-        // 本机统计卡片：一张卡浓缩 当天/本周/累计 三行（一页两台 PC）。
-        // 主字体：数值含 万/亿/· 单位，不在 14px 小字体的字符集里
-        if (acc.local_stats && acc.today_tokens >= 0) {
-            auto add_row = [&](const std::string& line, uint32_t color) {
-                lv_obj_t* row_label = lv_label_create(card);
-                lv_obj_set_width(row_label, lv_pct(100));
-                lv_obj_set_height(row_label, 18);
-                lv_label_set_long_mode(row_label, LV_LABEL_LONG_DOT);
-                lv_obj_set_style_text_font(row_label, PanelTextFont(), 0);
-                lv_obj_set_style_text_color(row_label, lv_color_hex(color), 0);
-                lv_label_set_text(row_label, line.c_str());
-            };
-            auto usage_line = [&](const char* tag, long long tokens, int requests, double cost) {
-                std::string line = tag;
-                line += " " + usage::FormatTokens(tokens);
-                if (requests >= 0) {
-                    line += " · " + std::to_string(requests) + "次";
-                }
-                return line + usage::CostSuffix(cost);
-            };
-            add_row(usage_line("日", acc.today_tokens, acc.requests, acc.today_cost), 0xE8EAED);
-            add_row(usage_line("周", acc.week_tokens, acc.week_requests, acc.week_cost), 0xE8EAED);
-            add_row("累计 " + usage::FormatTokens(acc.lifetime_tokens) +
-                        usage::CostSuffix(acc.lifetime_cost),
-                    0x9AA0A6);
+        if (acc.local_stats) {
+            return;
         }
 
-        // 官方账号：窗口用量单行（类型(重置倒计时) + 条内百分比）；无数据的窗口不显示
-        if (!acc.local_stats && acc.used_5h >= 0) {
+        // 官方账号：窗口块（5小时 + 每周；免费/prolite 套餐次窗口是 30 日）。
+        // 失败卡显示提示行 + 空轨道占位，保持版式稳定
+        if (acc.unavailable) {
+            lv_obj_t* dead_label = lv_label_create(card);
+            lv_obj_set_width(dead_label, lv_pct(100));
+            lv_obj_set_style_text_font(dead_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(dead_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_long_mode(dead_label, LV_LABEL_LONG_DOT);
+            lv_label_set_text(dead_label, "令牌异常 · 建议重新导入");
+            AddUsageWindowRow(card, "5小时", -1, -1);
+            return;
+        }
+        if (acc.used_5h >= 0) {
             AddUsageWindowRow(card, "5小时", acc.used_5h, acc.reset_5h);
         }
-        if (!acc.local_stats && acc.used_weekly >= 0) {
+        if (acc.used_weekly >= 0) {
             AddUsageWindowRow(card, "每周", acc.used_weekly, acc.reset_weekly);
-        }
-        // 免费/prolite 套餐的次窗口是 30 天而非每周
-        if (!acc.local_stats && acc.used_monthly >= 0) {
+        } else if (acc.used_monthly >= 0) {
             AddUsageWindowRow(card, "30日", acc.used_monthly, acc.reset_monthly);
         }
     }
@@ -2023,28 +2171,25 @@ form.inline{margin:0}
         esp_timer_start_periodic(usage_loading_timer_, 500000);
     }
 
-    // 每日 token 用量柱状图（官方 daily_usage_buckets，取末尾最多 7 天，柱下带日期标签）。
-    // 详情页中 flex_grow 伸展吃满剩余屏幕空间，柱高按数据归一化
+    // 近 14 天每日用量柱状图（官方 daily_usage_buckets，取末尾最多 14 天）：
+    // 日期坐标直接嵌在每根柱底（16px 轨道区）；今日亮青、峰日（>80% 峰值）琥珀、其余暗青。
+    // flex_grow 吃满详情页剩余高度，柱高按数据归一化
     void AddDailyTokensChart(lv_obj_t* parent, const std::vector<std::pair<std::string, long long>>& buckets) {
-        auto font = PanelTextFont();
-
         lv_obj_t* chart = lv_obj_create(parent);
         lv_obj_set_width(chart, lv_pct(100));
-        lv_obj_set_height(chart, 40);
+        lv_obj_set_height(chart, 0);
         lv_obj_set_flex_grow(chart, 1);
-        lv_obj_set_style_bg_color(chart, lv_color_hex(0x1A2028), 0);
+        lv_obj_set_style_bg_color(chart, lv_color_hex(kPanelCard), 0);
         lv_obj_set_style_bg_opa(chart, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(chart, 8, 0);
-        lv_obj_set_style_border_width(chart, 0, 0);
-        lv_obj_set_style_pad_hor(chart, 6, 0);
-        lv_obj_set_style_pad_ver(chart, 4, 0);
-        lv_obj_set_style_pad_column(chart, 4, 0);
+        lv_obj_set_style_border_width(chart, 1, 0);
+        lv_obj_set_style_border_color(chart, lv_color_hex(kPanelLine), 0);
+        lv_obj_set_style_pad_all(chart, 5, 0);
+        lv_obj_set_style_pad_column(chart, 1, 0);
         lv_obj_set_flex_flow(chart, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(chart, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_text_font(chart, font, 0);
 
-        size_t count = buckets.size() > 7 ? 7 : buckets.size();
+        size_t count = buckets.size() > 14 ? 14 : buckets.size();
         size_t offset = buckets.size() - count;
         long long max_tokens = 1;
         for (size_t i = offset; i < buckets.size(); i++) {
@@ -2052,15 +2197,10 @@ form.inline{margin:0}
         }
         for (size_t i = offset; i < buckets.size(); i++) {
             long long tokens = buckets[i].second;
-            // 柱高用百分比：图表高度随详情页剩余空间弹性变化，柱子按比例缩放
-            int pct_height = tokens > 0 ? (int)(tokens * 100 / max_tokens) : 0;
-            if (pct_height < 6) {
-                pct_height = 6;
-            }
-            lv_color_t color = tokens * 100 > max_tokens * 80
-                                   ? lv_color_hex(0xFBBC04)  // 高峰日黄色提示
-                                   : lv_color_hex(0x8AB4F8);
-            // 每天一列：柱子底部对齐日期标签；七列等宽铺满图表
+            bool is_today = (i + 1 == buckets.size());
+            bool is_peak = tokens * 100 > max_tokens * 80;
+
+            // 每根柱：上段用量填充（高度按峰值归一化，底对齐），下段 16px 日期坐标区
             lv_obj_t* column = lv_obj_create(chart);
             lv_obj_set_width(column, 0);
             lv_obj_set_flex_grow(column, 1);
@@ -2068,209 +2208,354 @@ form.inline{margin:0}
             lv_obj_set_style_bg_opa(column, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(column, 0, 0);
             lv_obj_set_style_pad_all(column, 0, 0);
-            lv_obj_set_style_pad_row(column, 2, 0);
+            lv_obj_set_style_pad_row(column, 1, 0);
             lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_flex_align(column, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_clear_flag(column, LV_OBJ_FLAG_SCROLLABLE);
 
-            lv_obj_t* bar = lv_obj_create(column);
-            lv_obj_set_width(bar, 14);
-            lv_obj_set_height(bar, lv_pct(pct_height));
-            lv_obj_set_style_bg_color(bar, color, 0);
-            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(bar, 2, 0);
-            lv_obj_set_style_border_width(bar, 0, 0);
-            lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t* bar_area = lv_obj_create(column);
+            lv_obj_set_width(bar_area, lv_pct(100));
+            lv_obj_set_height(bar_area, 0);
+            lv_obj_set_flex_grow(bar_area, 1);
+            lv_obj_set_style_bg_opa(bar_area, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(bar_area, 0, 0);
+            lv_obj_set_style_pad_all(bar_area, 0, 0);
+            lv_obj_set_flex_flow(bar_area, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(bar_area, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(bar_area, LV_OBJ_FLAG_SCROLLABLE);
 
-            // 日期标签：start_date 形如 2026-08-14，取两位日期
+            lv_obj_t* fill = lv_obj_create(bar_area);
+            lv_obj_set_width(fill, lv_pct(100));
+            int pct_height = tokens > 0 ? (int)(tokens * 100 / max_tokens) : 0;
+            if (pct_height < 4) {
+                pct_height = 4;
+            }
+            lv_obj_set_height(fill, lv_pct(pct_height));
+            lv_obj_set_style_bg_color(fill, lv_color_hex(is_today ? kPanelCyanLight
+                                                     : is_peak  ? 0xFBBB04
+                                                                : kPanelCyanDark),
+                                      0);
+            lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(fill, 2, 0);
+            lv_obj_set_style_border_width(fill, 0, 0);
+            lv_obj_set_style_pad_all(fill, 0, 0);
+            lv_obj_clear_flag(fill, LV_OBJ_FLAG_SCROLLABLE);
+
+            // 日期坐标（柱底）：start_date 形如 2026-08-14，取两位日期
             std::string day = buckets[i].first.size() >= 10 ? buckets[i].first.substr(8, 2) : "";
+            lv_obj_t* day_cell = lv_obj_create(column);
+            lv_obj_set_width(day_cell, lv_pct(100));
+            lv_obj_set_height(day_cell, 18);
+            lv_obj_set_style_bg_color(day_cell, lv_color_hex(is_today ? 0x0E3A46 : kPanelLine), 0);
+            lv_obj_set_style_bg_opa(day_cell, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(day_cell, 2, 0);
+            lv_obj_set_style_border_width(day_cell, 0, 0);
+            lv_obj_set_style_pad_all(day_cell, 0, 0);
+            lv_obj_clear_flag(day_cell, LV_OBJ_FLAG_SCROLLABLE);
             if (!day.empty()) {
-                lv_obj_t* day_label = lv_label_create(column);
+                lv_obj_t* day_label = lv_label_create(day_cell);
                 lv_obj_set_style_text_font(day_label, PanelSmallFont(), 0);
-                lv_obj_set_style_text_color(day_label, lv_color_hex(0x9AA0A6), 0);
+                lv_obj_set_style_text_color(day_label,
+                                            lv_color_hex(is_today ? kPanelCyanLight
+                                                         : is_peak  ? 0xFBBB04
+                                                                    : 0x9AA0A6),
+                                            0);
+                lv_obj_center(day_label);
                 lv_label_set_text(day_label, day.c_str());
             }
         }
     }
 
-    // 详情信息行：完整显示，超宽自动换行（高度随内容自适应，不省略）
-    void AddDetailInfoLine(lv_obj_t* parent, const std::string& text, uint32_t color) {
-        auto font = PanelTextFont();
-        lv_obj_t* label = lv_label_create(parent);
-        lv_obj_set_style_text_font(label, font, 0);
-        lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
-        lv_obj_set_width(label, lv_pct(100));
-        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-        lv_label_set_text(label, text.c_str());
+    // 详情页账户卡（一屏固定布局，无滚动）：名称(16px)+类型徽章，
+    // 下方数字小卡 = 官方(累计token/连续天数) 或 本机(累计token/累计费用)。
+    // 无值字段整块隐藏：智谱账号退化为单行，卡片高度自适应
+    void AddAccountCard(lv_obj_t* parent, const AccountDetail& acc) {
+        lv_obj_t* card = lv_obj_create(parent);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, lv_color_hex(kPanelCard), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(kPanelLine), 0);
+        lv_obj_set_style_pad_ver(card, 6, 0);
+        lv_obj_set_style_pad_hor(card, 7, 0);
+        lv_obj_set_style_pad_row(card, 4, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        // 名称行：邮箱(官方)/PC名(本机) 16px 中间档 + 类型徽章
+        lv_obj_t* title_row = lv_obj_create(card);
+        lv_obj_set_width(title_row, lv_pct(100));
+        lv_obj_set_height(title_row, 20);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_style_pad_column(title_row, 5, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* name_label = lv_label_create(title_row);
+        lv_obj_set_style_text_font(name_label, PanelMidFont(), 0);
+        lv_obj_set_style_text_color(name_label, lv_color_hex(acc.unavailable ? 0xEA4335 : 0xE8EAED), 0);
+        lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name_label, 0);
+        lv_obj_set_flex_grow(name_label, 1);
+        // 本机条目显示短名(本地@xx)：email 里的 "AI CLI @ <ip>" 过长必截断
+        lv_label_set_text(name_label,
+                          acc.local_stats ? acc.name.c_str()
+                                          : (acc.email.empty() ? acc.name.c_str() : acc.email.c_str()));
+
+        if (!acc.plan.empty()) {
+            uint32_t plan_text = 0;
+            uint32_t plan_bg = 0;
+            uint32_t plan_border = 0;
+            PlanBadgeColors(acc.plan, plan_text, plan_bg, plan_border);
+            lv_obj_t* plan_label = lv_label_create(title_row);
+            lv_obj_set_style_text_font(plan_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(plan_label, lv_color_hex(plan_text), 0);
+            lv_obj_set_style_bg_color(plan_label, lv_color_hex(plan_bg), 0);
+            lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(plan_label, 1, 0);
+            lv_obj_set_style_border_color(plan_label, lv_color_hex(plan_border), 0);
+            lv_obj_set_style_radius(plan_label, 4, 0);
+            lv_obj_set_style_pad_hor(plan_label, 5, 0);
+            lv_obj_set_style_pad_ver(plan_label, 2, 0);
+            lv_label_set_text(plan_label, acc.plan.c_str());
+        }
+
+        // 数字小卡对：只取有值的前两项
+        std::vector<std::pair<std::string, std::string>> stats;
+        if (acc.lifetime_tokens >= 0) {
+            stats.emplace_back("累计token", usage::FormatTokens(acc.lifetime_tokens));
+        }
+        if (!acc.local_stats && acc.current_streak_days >= 0) {
+            stats.emplace_back("连续天数", std::to_string(acc.current_streak_days) + "天");
+        } else if (acc.local_stats && acc.lifetime_cost >= 0) {
+            stats.emplace_back("累计费用", usage::CostText(acc.lifetime_cost, true));
+        }
+        if (stats.empty()) {
+            return;
+        }
+
+        lv_obj_t* stats_row = lv_obj_create(card);
+        lv_obj_set_width(stats_row, lv_pct(100));
+        lv_obj_set_height(stats_row, 44);
+        lv_obj_set_style_bg_opa(stats_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(stats_row, 0, 0);
+        lv_obj_set_style_pad_all(stats_row, 0, 0);
+        lv_obj_set_style_pad_column(stats_row, 4, 0);
+        lv_obj_set_flex_flow(stats_row, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(stats_row, LV_OBJ_FLAG_SCROLLABLE);
+        for (const auto& kv : stats) {
+            AddStatCard(stats_row, kv.first, kv.second);
+        }
     }
 
-    // 模型分类行：左模型名右 token+费用，均完整显示超宽换行（主字体含 万/亿/其余模型 等字）
-    void AddModelRow(lv_obj_t* parent, const std::string& name, const std::string& value) {
-        auto font = PanelTextFont();
-        lv_obj_t* row = lv_obj_create(parent);
+    // 数字小卡：左标签(14px 灰) 右值(16px 白)，屏幕底色形成内嵌层次
+    void AddStatCard(lv_obj_t* parent, const std::string& key, const std::string& value) {
+        lv_obj_t* stat = lv_obj_create(parent);
+        lv_obj_set_width(stat, 0);
+        lv_obj_set_flex_grow(stat, 1);
+        lv_obj_set_height(stat, lv_pct(100));
+        lv_obj_set_style_bg_color(stat, lv_color_hex(kPanelBg), 0);
+        lv_obj_set_style_bg_opa(stat, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(stat, 6, 0);
+        lv_obj_set_style_border_width(stat, 0, 0);
+        lv_obj_set_style_pad_ver(stat, 3, 0);
+        lv_obj_set_style_pad_hor(stat, 7, 0);
+        lv_obj_set_flex_flow(stat, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(stat, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(stat, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* key_label = lv_label_create(stat);
+        lv_obj_set_style_text_font(key_label, PanelSmallFont(), 0);
+        lv_obj_set_style_text_color(key_label, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(key_label, key.c_str());
+
+        lv_obj_t* value_label = lv_label_create(stat);
+        lv_obj_set_style_text_font(value_label, PanelMidFont(), 0);
+        lv_obj_set_style_text_color(value_label, lv_color_hex(0xE8EAED), 0);
+        lv_obj_set_width(value_label, lv_pct(100));
+        lv_obj_set_style_text_align(value_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(value_label, value.c_str());
+    }
+
+    // 详情页左右双卡壳：flex1 圆角描边卡，内容纵向均匀分布
+    lv_obj_t* DuoCardShell(lv_obj_t* parent) {
+        lv_obj_t* card = lv_obj_create(parent);
+        lv_obj_set_width(card, 0);
+        lv_obj_set_flex_grow(card, 1);
+        lv_obj_set_height(card, lv_pct(100));
+        lv_obj_set_style_bg_color(card, lv_color_hex(kPanelCard), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(kPanelLine), 0);
+        lv_obj_set_style_pad_ver(card, 6, 0);
+        lv_obj_set_style_pad_hor(card, 7, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        return card;
+    }
+
+    // 双卡标签行：左标签 + 右注（14px 灰）
+    void AddDuoLabelRow(lv_obj_t* card, const std::string& label, const std::string& note) {
+        lv_obj_t* row = lv_obj_create(card);
         lv_obj_set_width(row, lv_pct(100));
         lv_obj_set_height(row, LV_SIZE_CONTENT);
         lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
-        lv_obj_set_style_pad_column(row, 6, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t* name_label = lv_label_create(row);
-        lv_obj_set_style_text_font(name_label, font, 0);
-        lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
-        lv_label_set_long_mode(name_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(name_label, 0);
-        lv_obj_set_flex_grow(name_label, 1);
-        lv_label_set_text(name_label, name.c_str());
+        lv_obj_t* label_obj = lv_label_create(row);
+        lv_obj_set_style_text_font(label_obj, PanelSmallFont(), 0);
+        lv_obj_set_style_text_color(label_obj, lv_color_hex(0x9AA0A6), 0);
+        lv_label_set_text(label_obj, label.c_str());
 
-        lv_obj_t* value_label = lv_label_create(row);
-        lv_obj_set_style_text_font(value_label, font, 0);
-        lv_obj_set_style_text_color(value_label, lv_color_hex(0x9AA0A6), 0);
-        lv_obj_set_width(value_label, 100);
-        lv_obj_set_style_text_align(value_label, LV_TEXT_ALIGN_RIGHT, 0);
-        lv_label_set_long_mode(value_label, LV_LABEL_LONG_WRAP);
-        lv_label_set_text(value_label, value.c_str());
-    }
+        lv_obj_t* spacer = lv_obj_create(row);
+        lv_obj_set_width(spacer, 0);
+        lv_obj_set_flex_grow(spacer, 1);
+        lv_obj_set_height(spacer, 1);
+        lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(spacer, 0, 0);
+        lv_obj_set_style_pad_all(spacer, 0, 0);
 
-    // 账号信息模块自动循环滚动：内容高于模块时缓慢下滚，到底停留后回顶部。
-    // 设备无触摸屏，滚动由定时器驱动；面板销毁时回调自行清理
-    static void InfoScrollTimerCb(lv_timer_t* timer) {
-        DisplayLockGuard lock(instance_->GetDisplay());
-        lv_obj_t* card = instance_->info_card_;
-        if (card == nullptr || !lv_obj_is_valid(card)) {
-            lv_timer_delete(timer);
-            if (instance_->info_scroll_timer_ == timer) {
-                instance_->info_scroll_timer_ = nullptr;
-            }
-            return;
-        }
-        if (instance_->info_scroll_hold_ > 0) {
-            instance_->info_scroll_hold_--;
-            return;
-        }
-        if (lv_obj_get_scroll_bottom(card) > 0) {
-            lv_obj_scroll_by(card, 0, 1, LV_ANIM_OFF);
-        } else {
-            instance_->info_scroll_hold_ = 40;  // 到底/顶部停留约 3 秒再继续
-            lv_obj_scroll_to_y(card, 0, LV_ANIM_OFF);
+        if (!note.empty()) {
+            lv_obj_t* note_label = lv_label_create(row);
+            lv_obj_set_style_text_font(note_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(note_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(note_label, note.c_str());
         }
     }
 
-    // 详情页第二行：账号信息模块（14px 小字体，固定高度）。
-    // 邮箱完整换行 + 套餐徽章；订阅/积分/连续/峰值/累计/令牌刷新等无值字段隐藏；
-    // 内容超出模块高度时自动循环滚动
-    void AddAccountInfoCard(lv_obj_t* parent, const AccountDetail& acc) {
-        auto small = PanelSmallFont();
+    // 双卡大数值行：20px 居中，卡片第一视觉层级
+    void AddDuoBigText(lv_obj_t* card, const std::string& text, uint32_t color) {
+        lv_obj_t* label = lv_label_create(card);
+        lv_obj_set_style_text_font(label, PanelTextFont(), 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(label, text.c_str());
+    }
 
-        lv_obj_t* card = lv_obj_create(parent);
-        info_card_ = card;
-        lv_obj_set_width(card, lv_pct(100));
-        lv_obj_set_height(card, 92);
-        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A2028), 0);
-        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(card, 8, 0);
-        lv_obj_set_style_border_width(card, 0, 0);
-        lv_obj_set_style_pad_all(card, 6, 0);
-        lv_obj_set_style_pad_row(card, 3, 0);
-        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_scroll_dir(card, LV_DIR_VER);
-        lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
-
-        // 账号/邮箱（完整换行显示）+ 套餐徽章
-        lv_obj_t* title_row = lv_obj_create(card);
-        lv_obj_set_width(title_row, lv_pct(100));
-        lv_obj_set_height(title_row, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(title_row, 0, 0);
-        lv_obj_set_style_pad_all(title_row, 0, 0);
-        lv_obj_set_style_pad_column(title_row, 4, 0);
-        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t* email_label = lv_label_create(title_row);
-        // 账号身份行用 16px 中间档：与下方 14px 元数据行拉开层次
-        lv_obj_set_style_text_font(email_label, PanelMidFont(), 0);
-        lv_obj_set_style_text_color(email_label, lv_color_hex(acc.unavailable ? 0xEA4335 : 0xE8EAED), 0);
-        lv_label_set_long_mode(email_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(email_label, 0);
-        lv_obj_set_flex_grow(email_label, 1);
-        lv_label_set_text(email_label, acc.email.empty() ? acc.name.c_str() : acc.email.c_str());
-
-        if (!acc.plan.empty()) {
-            uint32_t plan_text = 0;
-            uint32_t plan_bg = 0;
-            PlanBadgeColors(acc.plan, plan_text, plan_bg);
-            lv_obj_t* plan_label = lv_label_create(title_row);
-            lv_obj_set_style_text_font(plan_label, small, 0);
-            lv_obj_set_style_text_color(plan_label, lv_color_hex(plan_text), 0);
-            lv_obj_set_style_bg_color(plan_label, lv_color_hex(plan_bg), 0);
-            lv_obj_set_style_bg_opa(plan_label, LV_OPA_COVER, 0);
-            lv_obj_set_style_radius(plan_label, 5, 0);
-            lv_obj_set_style_pad_hor(plan_label, 4, 0);
-            lv_obj_set_style_pad_ver(plan_label, 1, 0);
-            lv_label_set_text(plan_label, acc.plan.c_str());
+    // 详情页官方窗口双卡：标签行(窗口名+重置时刻) + 20px 语义色大百分比 + 8 段刻度条
+    void AddPctDuoCard(lv_obj_t* parent, const std::string& label, int used_pct, int reset_seconds) {
+        lv_obj_t* card = DuoCardShell(parent);
+        AddDuoLabelRow(card, label, FormatResetClock(reset_seconds));
+        uint32_t pct_color = 0x9AA0A6;
+        if (used_pct >= 90) {
+            pct_color = 0xEA4335;
+        } else if (used_pct >= 70) {
+            pct_color = 0xFBBB04;
+        } else if (used_pct >= 0) {
+            pct_color = 0x34A853;
         }
+        AddDuoBigText(card, used_pct >= 0 ? std::to_string(used_pct) + "%" : "--", pct_color);
+        AddSegBar(card, used_pct, 8, false);
+    }
 
-        // 信息行：仅拼接有值字段，"·" 分隔，超宽换行
-        std::string info;
-        auto append_info = [&](const std::string& item) {
-            info += (info.empty() ? "" : " · ") + item;
+    // 详情页本机双卡：标签行(窗口名+次数) + 20px 青色大数值 + 底部费用行
+    void AddLocalDuoCard(lv_obj_t* parent, const std::string& label, const std::string& big_text,
+                         int requests, double cost) {
+        lv_obj_t* card = DuoCardShell(parent);
+        AddDuoLabelRow(card, label, requests >= 0 ? std::to_string(requests) + "次" : "");
+        AddDuoBigText(card, big_text, kPanelCyan);
+        // 底部费用行（14px 灰，右对齐；无值时省略）
+        std::string cost_text = cost >= 0 ? usage::CostText(cost, true) : "";
+        if (!cost_text.empty()) {
+            AddDuoLabelRow(card, "", cost_text);
+        }
+    }
+
+    // 本机模型分类块（14px 两列）：标题 + 前 2 项 + 其余汇总，吃满剩余空间均匀分布
+    void AddModelSection(lv_obj_t* parent, const AccountDetail& acc) {
+        auto add_row = [&](const std::string& name, const std::string& value) {
+            lv_obj_t* row = lv_obj_create(parent);
+            lv_obj_set_width(row, lv_pct(100));
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_style_pad_column(row, 6, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t* name_label = lv_label_create(row);
+            lv_obj_set_style_text_font(name_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(name_label, lv_color_hex(0xE8EAED), 0);
+            lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+            lv_obj_set_width(name_label, 0);
+            lv_obj_set_flex_grow(name_label, 1);
+            lv_label_set_text(name_label, name.c_str());
+
+            lv_obj_t* value_label = lv_label_create(row);
+            lv_obj_set_style_text_font(value_label, PanelSmallFont(), 0);
+            lv_obj_set_style_text_color(value_label, lv_color_hex(0x9AA0A6), 0);
+            lv_label_set_text(value_label, value.c_str());
         };
-        if (acc.unavailable) {
-            append_info(acc.local_stats ? "状态: 服务不可达,检查PC端服务" : "状态: 令牌异常,建议重新导入");
-        } else {
-            if (!acc.subscription_until.empty()) {
-                append_info("订阅至 " + acc.subscription_until);
-            }
-            if (acc.reset_credits > 0) {
-                append_info("积分" + std::to_string(acc.reset_credits));
-            }
-            if (acc.current_streak_days >= 0) {
-                append_info("连续" + std::to_string(acc.current_streak_days) + "天");
-            }
-            if (acc.peak_daily_tokens >= 0) {
-                append_info("峰值" + usage::FormatTokens(acc.peak_daily_tokens));
-            }
-            if (acc.lifetime_tokens >= 0) {
-                append_info("累计 " + usage::FormatTokens(acc.lifetime_tokens) +
-                            usage::CostSuffix(acc.lifetime_cost));
-            }
-            if (!acc.last_refresh.empty()) {
-                append_info("令牌刷新 " + acc.last_refresh);
-            }
-            if (usage_updated_at_ > 0) {
-                char time_buf[16];
-                strftime(time_buf, sizeof(time_buf), "%H:%M", localtime(&usage_updated_at_));
-                append_info("更新 " + std::string(time_buf));
-            }
-        }
-        if (!info.empty()) {
-            lv_obj_t* info_label = lv_label_create(card);
-            lv_obj_set_style_text_font(info_label, small, 0);
-            lv_obj_set_style_text_color(info_label, lv_color_hex(0x9AA0A6), 0);
-            lv_obj_set_width(info_label, lv_pct(100));
-            lv_label_set_long_mode(info_label, LV_LABEL_LONG_WRAP);
-            lv_label_set_text(info_label, info.c_str());
-        }
 
-        info_scroll_hold_ = 0;
-        if (info_scroll_timer_ == nullptr) {
-            info_scroll_timer_ = lv_timer_create(InfoScrollTimerCb, 80, nullptr);
+        AddDuoLabelRow(parent, "当天模型", "");
+        size_t shown = acc.local_models.size() > 2 ? 2 : acc.local_models.size();
+        for (size_t i = 0; i < shown; i++) {
+            const auto& m = acc.local_models[i];
+            add_row(m.name, usage::FormatTokens(m.tokens) + " " + usage::CostText(m.cost, m.priced));
+        }
+        if (acc.local_models.size() > shown) {
+            long long rest_tokens = 0;
+            double rest_cost = 0;
+            bool rest_priced = true;
+            for (size_t i = shown; i < acc.local_models.size(); i++) {
+                rest_tokens += acc.local_models[i].tokens;
+                rest_cost += acc.local_models[i].cost > 0 ? acc.local_models[i].cost : 0;
+                rest_priced = rest_priced && acc.local_models[i].priced;
+            }
+            // 含未定价模型时费用被低估，显示 "-" 而非误导性的 $0.00
+            add_row("其余" + std::to_string(acc.local_models.size() - shown) + "模型",
+                    usage::FormatTokens(rest_tokens) + " " + usage::CostText(rest_cost, rest_priced));
         }
     }
 
-    // M 键从列表进入的单账号详情页；数据来自当前源分组缓存。
-    // 智谱账号显示与列表卡片相同的内容（套餐徽章 + 5h/周窗口），无数据的块自动隐藏
+    // 智谱账号不设详情页：仅 5h/周窗口百分比，与列表卡内容重复且无每日明细/元数据
+    static bool HasDetailPage(const AccountDetail& acc) {
+        return acc.name.rfind("智谱", 0) != 0;
+    }
+
+    // 详情页 L/R 切换：跳过无详情页的账号（智谱），循环回绕
+    void SwitchUsageDetail(int step) {
+        const auto& details = CurrentDetails();
+        if (details.empty()) {
+            return;
+        }
+        int index = CurrentDetailIndex();
+        for (int i = 1; i <= (int)details.size(); i++) {
+            int next = ((index + step * i) % (int)details.size() + (int)details.size()) % (int)details.size();
+            if (HasDetailPage(details[next])) {
+                ShowUsageDetailPanel(next);
+                return;
+            }
+        }
+    }
+
+    // M 键从列表进入的单账号详情页（一屏固定布局，无滚动条）：
+    // ① 账户卡（名称/类型徽章/累计token+连续天数数字小卡）
+    // ② 左右双卡（官方 5小时+7天，免费套餐次窗口 30天；本机 当天+本周）
+    // ③ 官方近 14 天柱状图 / 本机模型分类 / 均无数据时纵向均匀分布。
+    // 数据来自当前源分组缓存；L/R 循环切账号（跳过智谱），M 返回列表
     void ShowUsageDetailPanel(int index) {
         if (CurrentDetails().empty()) {
             return;
         }
         index = ((index % (int)CurrentDetails().size()) + (int)CurrentDetails().size()) % (int)CurrentDetails().size();
         const AccountDetail& acc = CurrentDetails()[index];
+        if (!HasDetailPage(acc)) {
+            return;
+        }
 
         std::string page_no = std::to_string(index + 1) + "/" + std::to_string(CurrentDetails().size());
         lv_obj_t* content = CreateUsagePanelBase("账号详情", page_no.c_str());
@@ -2285,73 +2570,50 @@ form.inline{margin:0}
         DisplayLockGuard lock(GetDisplay());
         ESP_LOGI(TAG, "Show usage detail %d/%d", index + 1, (int)CurrentDetails().size());
 
-        // ② 账号信息模块：邮箱/套餐徽章 + 订阅/积分/连续/峰值/累计/令牌刷新/更新时间。
-        // 无值字段隐藏；内容超出模块高度时自动循环滚动（完整显示）
-        AddAccountInfoCard(content, acc);
+        // ① 账户卡
+        AddAccountCard(content, acc);
 
-        // ③④ 窗口用量行（固定行高；无数据的窗口不显示，5h 缺失时高度稳定由图表补位）。
-        // 本机统计无配额概念：当天/本周用左右行显示 token 数与费用
-        if (acc.local_stats) {
-            auto local_value = [](long long tokens, int requests, double cost) {
-                std::string value = usage::FormatTokens(tokens);
-                if (requests >= 0) {
-                    value += " · " + std::to_string(requests) + "次";
+        // ② 左右双卡（固定高 92）
+        bool has_duo = acc.local_stats ? acc.today_tokens >= 0 || acc.week_tokens >= 0
+                                       : acc.used_5h >= 0 || acc.used_weekly >= 0 || acc.used_monthly >= 0;
+        if (has_duo) {
+            lv_obj_t* duo = lv_obj_create(content);
+            lv_obj_set_width(duo, lv_pct(100));
+            lv_obj_set_height(duo, 92);
+            lv_obj_set_style_bg_opa(duo, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(duo, 0, 0);
+            lv_obj_set_style_pad_all(duo, 0, 0);
+            lv_obj_set_style_pad_column(duo, 4, 0);
+            lv_obj_set_flex_flow(duo, LV_FLEX_FLOW_ROW);
+            lv_obj_clear_flag(duo, LV_OBJ_FLAG_SCROLLABLE);
+
+            if (acc.local_stats) {
+                AddLocalDuoCard(duo, "当天", usage::FormatTokens(acc.today_tokens),
+                                acc.requests, acc.today_cost);
+                AddLocalDuoCard(duo, "本周", usage::FormatTokens(acc.week_tokens),
+                                acc.week_requests, acc.week_cost);
+            } else if (acc.used_5h >= 0) {
+                AddPctDuoCard(duo, "5小时", acc.used_5h, acc.reset_5h);
+                if (acc.used_weekly >= 0) {
+                    AddPctDuoCard(duo, "7天", acc.used_weekly, acc.reset_weekly);
+                } else {
+                    AddPctDuoCard(duo, "30天", acc.used_monthly, acc.reset_monthly);
                 }
-                return value + usage::CostSuffix(cost);
-            };
-            if (acc.today_tokens >= 0) {
-                AddModelRow(content, "当天用量",
-                            local_value(acc.today_tokens, acc.requests, acc.today_cost));
-            }
-            if (acc.week_tokens >= 0) {
-                AddModelRow(content, "本周用量",
-                            local_value(acc.week_tokens, acc.week_requests, acc.week_cost));
-            }
-        } else {
-            if (acc.used_5h >= 0) {
-                AddUsageWindowRow(content, "5小时", acc.used_5h, acc.reset_5h);
-            }
-            if (acc.used_weekly >= 0) {
-                AddUsageWindowRow(content, "每周", acc.used_weekly, acc.reset_weekly);
-            }
-            if (acc.used_monthly >= 0) {
-                AddUsageWindowRow(content, "30天", acc.used_monthly, acc.reset_monthly);
-            }
-            if (acc.used_cr >= 0) {
-                AddUsageWindowRow(content, "代码审查", acc.used_cr, acc.reset_cr);
+            } else if (acc.used_weekly >= 0) {
+                AddPctDuoCard(duo, "7天", acc.used_weekly, acc.reset_weekly);
+            } else {
+                AddPctDuoCard(duo, "30天", acc.used_monthly, acc.reset_monthly);
             }
         }
 
-        // 本机模型最多显示两项，其余合并为一项。
-        if (acc.local_stats && !acc.local_models.empty()) {
-            AddDetailInfoLine(content, "模型分类", 0x9AA0A6);
-            size_t shown = acc.local_models.size() > 2 ? 2 : acc.local_models.size();
-            for (size_t i = 0; i < shown; i++) {
-                const auto& m = acc.local_models[i];
-                AddModelRow(content, m.name,
-                            usage::FormatTokens(m.tokens) + " " + usage::CostText(m.cost, m.priced));
-            }
-            if (acc.local_models.size() > shown) {
-                long long rest_tokens = 0;
-                double rest_cost = 0;
-                bool rest_priced = true;
-                for (size_t i = shown; i < acc.local_models.size(); i++) {
-                    rest_tokens += acc.local_models[i].tokens;
-                    rest_cost += acc.local_models[i].cost > 0 ? acc.local_models[i].cost : 0;
-                    rest_priced = rest_priced && acc.local_models[i].priced;
-                }
-                // 含未定价模型时费用被低估，显示 "-" 而非误导性的 $0.00
-                AddModelRow(content, "其余" + std::to_string(acc.local_models.size() - shown) + "模型",
-                            usage::FormatTokens(rest_tokens) + " " + usage::CostText(rest_cost, rest_priced));
-            }
-        }
-
-        // ⑤ 最后一行：近 7 天每日用量柱状图（带日期标签，弹性吃满剩余空间）。
-        // 无图表数据的账号（智谱/本机/查询失败）改为内容纵向均匀分布，不留大片空白
+        // ③ 官方近 14 天柱状图；本机改模型分类；两者皆无 → 内容纵向均匀分布
         if (!acc.local_stats && !acc.daily_buckets.empty()) {
             AddDailyTokensChart(content, acc.daily_buckets);
         } else {
             lv_obj_set_flex_align(content, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+            if (acc.local_stats && !acc.local_models.empty()) {
+                AddModelSection(content, acc);
+            }
         }
 
         RestartUsagePanelTimer(GetUsagePanelHideTimeoutUs(30000000LL));
@@ -2442,7 +2704,9 @@ form.inline{margin:0}
         }
         if (restore >= 0 && !CurrentDetails().empty()) {
             ShowUsageDetailPanel(restore);
-            return;
+            if (usage_panel_ != nullptr) {
+                return;
+            }
         }
 
         ShowUsageListPage();
@@ -2557,7 +2821,7 @@ form.inline{margin:0}
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
             if (self->CurrentDetailIndex() >= 0) {
-                self->ShowUsageDetailPanel(self->CurrentDetailIndex() - 1);
+                self->SwitchUsageDetail(-1);
                 return;
             }
             if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
@@ -2580,8 +2844,15 @@ form.inline{margin:0}
                 if (self->CurrentDetailIndex() >= 0) {
                     self->BackToUsageList();
                 } else {
-                    // 从当前页的第一个账号进入详情（超出总数时由详情页取模回绕）
-                    self->ShowUsageDetailPanel(self->CurrentListPage() * self->UsageCardsPerPage());
+                    // 从当前页的第一个有详情账号进入（智谱无详情页）；整页均无则不动作
+                    int begin = self->CurrentListPage() * self->UsageCardsPerPage();
+                    int end = std::min(begin + self->UsageCardsPerPage(), (int)self->CurrentDetails().size());
+                    for (int i = begin; i < end; i++) {
+                        if (HasDetailPage(self->CurrentDetails()[i])) {
+                            self->ShowUsageDetailPanel(i);
+                            break;
+                        }
+                    }
                 }
                 return;
             }
@@ -2650,7 +2921,7 @@ form.inline{margin:0}
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
             if (self->CurrentDetailIndex() >= 0) {
-                self->ShowUsageDetailPanel(self->CurrentDetailIndex() + 1);
+                self->SwitchUsageDetail(1);
                 return;
             }
             if (self->usage_panel_ != nullptr && !self->usage_config_mode_) {
