@@ -5,7 +5,9 @@
     "builds": [
         {
             "name": "atk-dnesp32s3-box2-wifi",
-            "sdkconfig_append": []
+            "sdkconfig_append": [
+                "CONFIG_LANGUAGE_ZH_CN=y"
+            ]
         }
     ]
 }

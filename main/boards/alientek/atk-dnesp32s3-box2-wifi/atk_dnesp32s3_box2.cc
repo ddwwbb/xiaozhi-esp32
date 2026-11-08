@@ -200,7 +200,7 @@ private:
         };
 
         button_config_t m_btn_cfg = {
-            .long_press_time = 800,
+            .long_press_time = 2500,
             .short_press_time = 500
         };
 
@@ -209,12 +209,19 @@ private:
             .short_press_time = 500
         };
 
+        button_config_t q_btn_cfg = {
+            .long_press_time = 2500,
+            .short_press_time = 500
+        };
+
         button_driver_t* xio_l_btn_driver_ = nullptr;
         button_driver_t* xio_m_btn_driver_ = nullptr;
+        button_driver_t* xio_q_btn_driver_ = nullptr;
 
         button_handle_t l_btn_handle = NULL;
         button_handle_t m_btn_handle = NULL;
         button_handle_t r_btn_handle = NULL;
+        button_handle_t q_btn_handle = NULL;
 
         xio_l_btn_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
         xio_l_btn_driver_->enable_power_save = false;
@@ -229,6 +236,19 @@ private:
             return instance_->IoExpanderGetLevel(XIO_KEY_M);
         };
         ESP_ERROR_CHECK(iot_button_create(&m_btn_cfg, xio_m_btn_driver_, &m_btn_handle));
+
+        // KEY_Q 极性未经原厂代码确认，按低有效处理（与 KEY_L 一致）。若上电即读到“按下”，
+        // 说明极性相反或按键被按住：不注册该键，避免开机即进入常驻录音。真机须实测确认。
+        if (IoExpanderGetLevel(XIO_KEY_Q) == 0) {
+            ESP_LOGE(TAG, "KEY_Q reads active at boot, push-to-talk disabled (check polarity)");
+        } else {
+            xio_q_btn_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
+            xio_q_btn_driver_->enable_power_save = false;
+            xio_q_btn_driver_->get_key_level = [](button_driver_t *button_driver) -> uint8_t {
+                return !instance_->IoExpanderGetLevel(XIO_KEY_Q);
+            };
+            ESP_ERROR_CHECK(iot_button_create(&q_btn_cfg, xio_q_btn_driver_, &q_btn_handle));
+        }
 
         button_gpio_config_t r_cfg = {
             .gpio_num = R_BUTTON_GPIO,
@@ -253,8 +273,17 @@ private:
         iot_button_register_cb(m_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
             self->power_save_timer_->WakeUp();
+            // 网关不做服务端 VAD：必须使用 manual 模式（StartListening），
+            // ToggleChatState 在 Idle 下会进入 auto/realtime 模式，播报结束后自动重新录音且无人结束
             auto& app = Application::GetInstance();
-            app.ToggleChatState();
+            auto state = app.GetDeviceState();
+            if (state == kDeviceStateIdle) {
+                app.StartListening();
+            } else if (state == kDeviceStateListening) {
+                app.StopListening();
+            } else {
+                app.ToggleChatState();
+            }
         }, this);
 
         iot_button_register_cb(m_btn_handle, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
@@ -277,6 +306,21 @@ private:
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
         }, this);
+
+        // Q 键：对讲按键（按住录音，松开停止）。播报中按下的打断由主循环
+        // HandleStartListeningEvent 完成，不在按键任务里直接调用 AbortSpeaking。
+        // 松开时无条件投递 StopListening：连接中松开由 pending_stop_listening_ 兜住。
+        if (q_btn_handle != NULL) {
+            iot_button_register_cb(q_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
+                auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
+                self->power_save_timer_->WakeUp();
+                Application::GetInstance().StartListening();
+            }, this);
+
+            iot_button_register_cb(q_btn_handle, BUTTON_PRESS_UP, nullptr, [](void* button_handle, void* usr_data) {
+                Application::GetInstance().StopListening();
+            }, this);
+        }
 
         iot_button_register_cb(r_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);

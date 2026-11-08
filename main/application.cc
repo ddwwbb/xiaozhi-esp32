@@ -577,7 +577,7 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (GetDeviceState() == kDeviceStateSpeaking && !aborted_) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -858,9 +858,20 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
         if (!protocol_->OpenAudioChannel()) {
             // Return to idle so the device is not stuck in the connecting
             // state (not every failure path reports a network error)
+            pending_stop_listening_ = false;
             SetDeviceState(kDeviceStateIdle);
             return;
         }
+    }
+
+    // Push-to-talk released while the channel was still connecting:
+    // do not enter a manual listening session that nobody will stop.
+    if (pending_stop_listening_ ||
+        (xEventGroupGetBits(event_group_) & MAIN_EVENT_STOP_LISTENING)) {
+        pending_stop_listening_ = false;
+        xEventGroupClearBits(event_group_, MAIN_EVENT_STOP_LISTENING);
+        SetDeviceState(kDeviceStateIdle);
+        return;
     }
 
     SetListeningMode(mode);
@@ -868,6 +879,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
+    pending_stop_listening_ = false;
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -916,6 +928,8 @@ void Application::HandleStopListeningEvent() {
             protocol_->SendStopListening();
         }
         SetDeviceState(kDeviceStateIdle);
+    } else if (state == kDeviceStateConnecting) {
+        pending_stop_listening_ = true;
     }
 }
 
@@ -1037,7 +1051,7 @@ void Application::HandleStateChangedEvent() {
             // otherwise wipe the status, emotion, and chat message.
             if (last_error_message_.empty()) {
                 display->SetStatus(Lang::Strings::STANDBY);
-                display->ClearChatMessages();  // Clear messages first
+                // Keep the last turn visible in idle; chat is cleared on the next listening start
                 display->SetEmotion(
                     "neutral");  // Then set emotion (wechat mode checks child count)
             }
@@ -1050,6 +1064,9 @@ void Application::HandleStateChangedEvent() {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+            if (listening_mode_ == kListeningModeManualStop) {
+                display->ClearChatMessages();  // Clear previous turn on new manual recording
+            }
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
@@ -1268,6 +1285,7 @@ void Application::Schedule(std::function<void()>&& callback) {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
+    audio_service_.ResetDecoder();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }
