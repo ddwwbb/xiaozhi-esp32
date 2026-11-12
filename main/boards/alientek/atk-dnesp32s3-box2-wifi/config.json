@@ -6,8 +6,7 @@
         {
             "name": "atk-dnesp32s3-box2-wifi",
             "sdkconfig_append": [
-                "CONFIG_LANGUAGE_ZH_CN=y",
-                "CONFIG_OTA_URL=https://box.u2m.top/xiaozhi/ota/"
+                "CONFIG_OTA_URL=\"https://box.u2m.top/xiaozhi/ota/\""
             ]
         }
     ]
