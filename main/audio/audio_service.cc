@@ -1,6 +1,103 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+
+namespace {
+
+uint64_t PackVisualSnapshot(float level, const float bands[5]) {
+    auto to_u8 = [](float v) -> uint64_t {
+        float clamped = std::clamp(v, 0.0f, 1.0f);
+        return static_cast<uint64_t>(clamped * 255.0f + 0.5f);
+    };
+    uint64_t packed = to_u8(level);
+    for (int i = 0; i < 5; ++i) {
+        packed |= (to_u8(bands[i]) << ((i + 1) * 8));
+    }
+    return packed;
+}
+
+AudioVisualSnapshot UnpackVisualSnapshot(uint64_t packed, bool active) {
+    AudioVisualSnapshot snap;
+    snap.active = active;
+    snap.level = static_cast<float>(packed & 0xFFu) / 255.0f;
+    for (int i = 0; i < 5; ++i) {
+        snap.bands[i] = static_cast<float>((packed >> ((i + 1) * 8)) & 0xFFu) / 255.0f;
+    }
+    return snap;
+}
+
+uint64_t AnalyzePcmWindow(const int16_t* pcm, size_t frames, int stride) {
+    if (pcm == nullptr || frames == 0 || stride <= 0) {
+        return 0;
+    }
+    int64_t sum_abs = 0;
+    int32_t peak_abs = 0;
+    int64_t sum_low4 = 0;
+    int64_t sum_low2 = 0;
+    int64_t sum_diff1 = 0;
+    int64_t sum_diff2 = 0;
+
+    int32_t s_prev1 = pcm[0];
+    int32_t s_prev2 = pcm[0];
+    int32_t s_prev3 = pcm[0];
+
+    // Step by at most ~240 samples per window to keep CPU cost < 15us
+    const size_t step = (frames > 240) ? (frames / 240) : 1;
+    size_t count = 0;
+    for (size_t i = 0; i < frames; i += step) {
+        int32_t s = pcm[i * stride];
+        int32_t a = std::abs(s);
+        sum_abs += a;
+        if (a > peak_abs) {
+            peak_abs = a;
+        }
+        int32_t low4 = (s + s_prev1 + s_prev2 + s_prev3) >> 2;
+        int32_t low2 = (s + s_prev1) >> 1;
+        int32_t d1 = s - s_prev1;
+        int32_t d2 = s - (s_prev1 << 1) + s_prev2;
+
+        sum_low4 += std::abs(low4);
+        sum_low2 += std::abs(low2);
+        sum_diff1 += std::abs(d1);
+        sum_diff2 += std::abs(d2);
+
+        s_prev3 = s_prev2;
+        s_prev2 = s_prev1;
+        s_prev1 = s;
+        ++count;
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+
+    float mean_abs = static_cast<float>(sum_abs) / static_cast<float>(count);
+    if (mean_abs < 55.0f && peak_abs < 220) {
+        return 0;
+    }
+
+    float norm_mean = std::sqrt(std::min(1.0f, mean_abs / 4800.0f));
+    float norm_peak = std::min(1.0f, static_cast<float>(peak_abs) / 13000.0f);
+    float level = std::clamp(norm_mean * 0.72f + norm_peak * 0.28f, 0.0f, 1.0f);
+
+    float m_low4 = static_cast<float>(sum_low4) / static_cast<float>(count);
+    float m_low2 = static_cast<float>(sum_low2) / static_cast<float>(count);
+    float m_d1 = static_cast<float>(sum_diff1) / static_cast<float>(count);
+    float m_d2 = static_cast<float>(sum_diff2) / static_cast<float>(count);
+
+    float bands[5];
+    bands[0] = std::sqrt(std::min(1.0f, m_low4 / 4200.0f));
+    bands[1] = std::sqrt(std::min(1.0f, m_low2 / 4500.0f));
+    bands[2] = level;
+    bands[3] = std::sqrt(std::min(1.0f, m_d1 / 3200.0f));
+    bands[4] = std::sqrt(std::min(1.0f, m_d2 / 4600.0f));
+
+    return PackVisualSnapshot(level, bands);
+}
+
+}  // namespace
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)                                        \
     (esp_ae_rate_cvt_cfg_t) {                                                                \
@@ -190,6 +287,7 @@ void AudioService::Stop() {
     if (notify_drained && callbacks_.on_playback_drained) {
         callbacks_.on_playback_drained();
     }
+    ClearOutputVisualMetrics();
 }
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
@@ -227,6 +325,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     /* Update the last input time */
     last_input_time_ = std::chrono::steady_clock::now();
     debug_statistics_.input_count++;
+    UpdateInputVisualMetrics(data.data(), data.size(), codec_->input_channels());
 
 #if CONFIG_USE_AUDIO_DEBUGGER
     // 音频调试：发送原始音频数据
@@ -348,6 +447,7 @@ void AudioService::AudioOutputTask() {
             callbacks_.on_playback_progress(task.playback_id, task.media_position_ms);
         }
 
+        UpdateOutputVisualMetrics(task.pcm.data(), task.pcm.size(), codec_->output_sample_rate());
         codec_->OutputData(task.pcm);
 
         /* Update the last output time */
@@ -819,6 +919,7 @@ void AudioService::ResetDecoder() {
     if (notify_drained && callbacks_.on_playback_drained) {
         callbacks_.on_playback_drained();
     }
+    ClearOutputVisualMetrics();
 }
 
 bool AudioService::IsPlaybackDrainedLocked() const {
@@ -882,4 +983,69 @@ bool AudioService::InitializeAudioEngine() {
     audio_engine_initialized_ = true;
     audio_engine_->EnableDeviceAec(device_aec_enabled_);
     return true;
+}
+
+void AudioService::UpdateInputVisualMetrics(const int16_t* pcm, size_t samples, int channels) {
+    if (pcm == nullptr || samples == 0) {
+        return;
+    }
+    int stride = std::max(1, channels);
+    size_t frames = samples / static_cast<size_t>(stride);
+    uint64_t packed = AnalyzePcmWindow(pcm, frames, stride);
+    input_visual_packed_.store(packed, std::memory_order_relaxed);
+    input_visual_time_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+}
+
+void AudioService::UpdateOutputVisualMetrics(const int16_t* pcm, size_t samples, int sample_rate) {
+    if (pcm == nullptr || samples == 0) {
+        return;
+    }
+    size_t slice_samples = std::max<size_t>(1, samples / kOutputVisualSlices);
+    int32_t total_duration_us =
+        (sample_rate > 0) ? static_cast<int32_t>((samples * 1000000ULL) / sample_rate) : 60000;
+    int32_t slice_us =
+        std::max<int32_t>(5000, total_duration_us / static_cast<int32_t>(kOutputVisualSlices));
+
+    for (size_t i = 0; i < kOutputVisualSlices; ++i) {
+        size_t offset = std::min(samples - 1, i * slice_samples);
+        size_t len = (i + 1 == kOutputVisualSlices) ? (samples - offset)
+                                                    : std::min(slice_samples, samples - offset);
+        uint64_t packed = AnalyzePcmWindow(pcm + offset, len, 1);
+        output_visual_slices_[i].store(packed, std::memory_order_relaxed);
+    }
+    output_visual_slice_us_.store(slice_us, std::memory_order_relaxed);
+    output_visual_start_us_.store(esp_timer_get_time(), std::memory_order_relaxed);
+}
+
+void AudioService::ClearOutputVisualMetrics() {
+    output_visual_start_us_.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < kOutputVisualSlices; ++i) {
+        output_visual_slices_[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+AudioVisualSnapshot AudioService::GetVisualSnapshot() const {
+    const int64_t now_us = esp_timer_get_time();
+
+    const int64_t out_start = output_visual_start_us_.load(std::memory_order_relaxed);
+    const int32_t slice_us = output_visual_slice_us_.load(std::memory_order_relaxed);
+    if (out_start > 0 && slice_us > 0) {
+        const int64_t elapsed = now_us - out_start;
+        const int64_t max_window =
+            static_cast<int64_t>(slice_us) * static_cast<int64_t>(kOutputVisualSlices + 1);
+        if (elapsed >= 0 && elapsed < max_window) {
+            size_t idx = std::min<size_t>(kOutputVisualSlices - 1,
+                                          static_cast<size_t>(elapsed / slice_us));
+            uint64_t packed = output_visual_slices_[idx].load(std::memory_order_relaxed);
+            return UnpackVisualSnapshot(packed, true);
+        }
+    }
+
+    const int64_t in_time = input_visual_time_us_.load(std::memory_order_relaxed);
+    if (in_time > 0 && (now_us - in_time) <= 90000) {
+        uint64_t packed = input_visual_packed_.load(std::memory_order_relaxed);
+        return UnpackVisualSnapshot(packed, true);
+    }
+
+    return AudioVisualSnapshot{};
 }

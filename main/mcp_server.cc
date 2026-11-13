@@ -14,6 +14,7 @@
 
 #include "application.h"
 #include "board.h"
+#include "device_config.h"
 #include "display.h"
 #include "lvgl_image.h"
 #include "lvgl_theme.h"
@@ -115,6 +116,31 @@ void McpServer::AddCommonTools() {
                 });
     }
 #endif
+
+    AddTool("self.device.get_config",
+            "Read the device local/remote configuration JSON (listening_mode, wake_barge_in, "
+            "dim_timeout_sec, dim_brightness, dim_on_usb, battery_off_min, brightness, volume, "
+            "theme, skip_boot_ota, ota_url, config_version).",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                return DeviceConfig::GetInstance().ToJsonString(true);
+            });
+
+    AddTool("self.device.set_config",
+            "Update device configuration using a JSON object string. Supported keys: "
+            "listening_mode ('auto'|'manual'), wake_barge_in (bool), dim_timeout_sec (0..3600, "
+            "0 disables), dim_brightness (1..50), dim_on_usb (bool), battery_off_min (0..1440, "
+            "0 disables battery auto-off), brightness (1..100), volume (0..100), "
+            "theme ('light'|'dark'), skip_boot_ota (bool), ota_url (string).",
+            PropertyList({Property("config_json", kPropertyTypeString)}),
+            [](const PropertyList& properties) -> ToolResult {
+                auto raw = properties["config_json"].value<std::string>();
+                CJsonUniquePtr parsed(cJSON_Parse(raw.c_str()));
+                if (!parsed || !cJSON_IsObject(parsed.get())) {
+                    return std::unexpected("config_json must be a valid JSON object string");
+                }
+                DeviceConfig::GetInstance().ApplyJson(parsed.get(), -1, true);
+                return DeviceConfig::GetInstance().ToJsonString(true);
+            });
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), std::make_move_iterator(original_tools.begin()),

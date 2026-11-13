@@ -1,6 +1,7 @@
 #include "websocket_protocol.h"
 #include "application.h"
 #include "board.h"
+#include "device_config.h"
 #include "settings.h"
 #include "system_info.h"
 
@@ -161,7 +162,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
     // Callbacks run on the transport's receive task, which on 4G modems is the
     // AT event task and cannot send, so the Pong is sent from the main task.
     std::weak_ptr<WebSocket> weak_websocket = websocket_;
-    websocket_->OnPing([weak_websocket](const char* data, size_t len) {
+    websocket_->OnPing([this, weak_websocket](const char* data, size_t len) {
+        last_incoming_time_ = std::chrono::steady_clock::now();
         Application::GetInstance().Schedule([weak_websocket, payload = std::string(data, len)]() {
             if (auto websocket = weak_websocket.lock()) {
                 websocket->SendPong(payload.data(), payload.size());
@@ -259,6 +261,21 @@ void WebsocketProtocol::ParseServerHello(const cJSON* root) {
         auto frame_duration = cJSON_GetObjectItem(audio_params, "frame_duration");
         if (cJSON_IsNumber(frame_duration)) {
             server_frame_duration_ = frame_duration->valueint;
+        }
+    }
+
+    auto remote_cfg = cJSON_GetObjectItem(root, "config");
+    if (cJSON_IsObject(remote_cfg)) {
+        auto cfg_ver = cJSON_GetObjectItem(root, "config_version");
+        int ver = cJSON_IsNumber(cfg_ver) ? cfg_ver->valueint : -1;
+        DeviceConfig::GetInstance().ApplyJson(remote_cfg, ver, true);
+        if (ver > 0) {
+            int ack_ver = ver;
+            Application::GetInstance().Schedule([this, ack_ver]() {
+                if (IsAudioChannelOpened()) {
+                    SendConfigAck(ack_ver);
+                }
+            });
         }
     }
 

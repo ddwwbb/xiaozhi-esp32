@@ -5,12 +5,14 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include "device_config.h"
 #include "power_save_timer.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
 
 #include "i2c_device.h"
+#include <algorithm>
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 
@@ -36,6 +38,25 @@ private:
     esp_lcd_panel_handle_t panel = nullptr;
     int ticks_ = 0;
     const int kChgCtrlInterval = 5;
+    uint32_t last_io_exp_val_ = (XIO_KEY_L | XIO_KEY_Q);
+
+    void ApplyPowerSavePolicy(bool reset_cycle = false) {
+        if (power_save_timer_ == nullptr) {
+            return;
+        }
+        auto cfg = DeviceConfig::GetInstance().Snapshot();
+        const bool is_usb = (power_status_ == kDeviceTypecSupply);
+        const int sleep_sec = cfg.dim_timeout_sec > 0 ? cfg.dim_timeout_sec : -1;
+        const int shutdown_sec =
+            (!is_usb && cfg.battery_off_min > 0) ? (cfg.battery_off_min * 60) : -1;
+        const bool should_enable =
+            is_usb ? (cfg.dim_on_usb && sleep_sec > 0) : (sleep_sec > 0 || shutdown_sec > 0);
+        power_save_timer_->SetTimeouts(sleep_sec, shutdown_sec);
+        power_save_timer_->SetEnabled(should_enable);
+        if (reset_cycle && should_enable) {
+            power_save_timer_->WakeUp();
+        }
+    }
 
     void InitializeBoardPowerManager() {
         instance_ = this;
@@ -79,31 +100,37 @@ private:
         };
         ESP_ERROR_CHECK(esp_timer_create(&wake_display_timer_args, &wake_timer_handle_));
         ESP_ERROR_CHECK(esp_timer_start_periodic(wake_timer_handle_, 100000));
+
+        ApplyPowerSavePolicy(false);
+        DeviceConfig::GetInstance().AddChangeListener([this]() {
+            Application::GetInstance().Schedule([this]() { ApplyPowerSavePolicy(false); });
+        });
     }
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(io_exp_handle);
         power_manager_->OnChargingStatusChanged([this](bool is_charging) {
-            if (is_charging) {
-                power_save_timer_->SetEnabled(false);
-            } else {
-                power_save_timer_->SetEnabled(true);
-            }
+            power_status_ = is_charging ? kDeviceTypecSupply : kDeviceBatterySupply;
+            Application::GetInstance().Schedule(
+                [this, is_charging]() { ApplyPowerSavePolicy(!is_charging); });
         });
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            auto cfg = DeviceConfig::GetInstance().Snapshot();
+            uint8_t dim_bright = static_cast<uint8_t>(std::clamp(cfg.dim_brightness, 1, 50));
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(1);
+            GetBacklight()->SetBrightness(dim_bright);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() {
-            if (power_status_ == kDeviceBatterySupply) {
+            auto cfg = DeviceConfig::GetInstance().Snapshot();
+            if (power_status_ == kDeviceBatterySupply && cfg.battery_off_min > 0) {
                 GetBacklight()->SetBrightness(0);
                 esp_timer_stop(power_manager_->timer_handle_);
                 esp_io_expander_set_dir( io_exp_handle, XIO_CHG_CTRL, IO_EXPANDER_OUTPUT);
@@ -112,8 +139,6 @@ private:
                 esp_io_expander_set_level(io_exp_handle, XIO_SYS_POW, 0);
             }
         });
-
-        power_save_timer_->SetEnabled(true);
     }
 
     void audio_volume_change(bool direction) {
@@ -151,15 +176,25 @@ private:
     }
 
     uint8_t IoExpanderGetLevel(uint16_t pin_mask) {
-        uint32_t pin_val = 0;
-        esp_io_expander_get_level(io_exp_handle, DRV_IO_EXP_INPUT_MASK, &pin_val);
+        uint32_t pin_val = last_io_exp_val_;
+        if (esp_io_expander_get_level(io_exp_handle, DRV_IO_EXP_INPUT_MASK, &pin_val) == ESP_OK) {
+            last_io_exp_val_ = pin_val;
+        }
         pin_mask &= DRV_IO_EXP_INPUT_MASK;
-        return (uint8_t)((pin_val & pin_mask) ? 1 : 0);
+        return (uint8_t)((last_io_exp_val_ & pin_mask) ? 1 : 0);
     }
 
     void InitializeIoExpander() {
-        esp_err_t ret = ESP_OK;
-        esp_io_expander_new_i2c_tca95xx_16bit(i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9555_ADDRESS_000, &io_exp_handle);
+        esp_err_t ret = ESP_FAIL;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (esp_io_expander_new_i2c_tca95xx_16bit(
+                    i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9555_ADDRESS_000, &io_exp_handle) == ESP_OK) {
+                ret = ESP_OK;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        assert(ret == ESP_OK);
 
         ret |= esp_io_expander_set_dir(io_exp_handle, DRV_IO_EXP_OUTPUT_MASK, IO_EXPANDER_OUTPUT);
         ret |= esp_io_expander_set_dir(io_exp_handle, DRV_IO_EXP_INPUT_MASK, IO_EXPANDER_INPUT);
@@ -272,18 +307,9 @@ private:
 
         iot_button_register_cb(m_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
+            ESP_LOGI(TAG, "KEY_M press down");
             self->power_save_timer_->WakeUp();
-            // 网关不做服务端 VAD：必须使用 manual 模式（StartListening），
-            // ToggleChatState 在 Idle 下会进入 auto/realtime 模式，播报结束后自动重新录音且无人结束
-            auto& app = Application::GetInstance();
-            auto state = app.GetDeviceState();
-            if (state == kDeviceStateIdle) {
-                app.StartListening();
-            } else if (state == kDeviceStateListening) {
-                app.StopListening();
-            } else {
-                app.ToggleChatState();
-            }
+            Application::GetInstance().ToggleChatState();
         }, this);
 
         iot_button_register_cb(m_btn_handle, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
@@ -313,11 +339,13 @@ private:
         if (q_btn_handle != NULL) {
             iot_button_register_cb(q_btn_handle, BUTTON_PRESS_DOWN, nullptr, [](void* button_handle, void* usr_data) {
                 auto self = static_cast<atk_dnesp32s3_box2_wifi*>(usr_data);
+                ESP_LOGI(TAG, "KEY_Q press down");
                 self->power_save_timer_->WakeUp();
                 Application::GetInstance().StartListening();
             }, this);
 
             iot_button_register_cb(q_btn_handle, BUTTON_PRESS_UP, nullptr, [](void* button_handle, void* usr_data) {
+                ESP_LOGI(TAG, "KEY_Q press up");
                 Application::GetInstance().StopListening();
             }, this);
         }
@@ -473,13 +501,8 @@ public:
     }
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
-        static bool last_discharging = false;
         charging = power_manager_->IsCharging();
         discharging = power_manager_->IsDischarging();
-        if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
-        }
         level = power_manager_->GetBatteryLevel();
         return true;
     }

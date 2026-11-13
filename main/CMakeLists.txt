@@ -17,6 +17,7 @@ set(SOURCES "audio/audio_codec.cc"
             "display/display.cc"
             "display/text_glyph.cc"
             "display/lcd_display.cc"
+            "display/fluid_orb.cc"
             "display/oled_display.cc"
             "display/lvgl_display/lvgl_display.cc"
             "display/emote_display.cc"
@@ -34,6 +35,8 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
+            "device_config.cc"
+            "local_config_server.cc"
             "system_info.cc"
             "application.cc"
             "ota.cc"
@@ -1201,6 +1204,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_psram
                         esp_netif
                         esp_eth
+                        esp_http_server
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
@@ -1226,6 +1230,8 @@ idf_component_register(SRCS ${SOURCES}
 # dialect; pin the baseline so main/ does not depend on it.
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     target_compile_options(${COMPONENT_LIB} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++23>)
+    # Per-pixel fluid orb renderer is hot (runs every LVGL frame); optimize for speed.
+    set_source_files_properties(display/fluid_orb.cc PROPERTIES COMPILE_OPTIONS "-O2")
 endif()
 
 # Use target_compile_definitions to define the reported board identity

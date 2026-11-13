@@ -4,7 +4,9 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "cjson_utils.h"
+#include "device_config.h"
 #include "display.h"
+#include "lvgl_theme.h"
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
@@ -176,6 +178,12 @@ void Application::Initialize() {
         }
     });
 
+    DeviceConfig::GetInstance().LoadFromNvs();
+    DeviceConfig::GetInstance().AddChangeListener([this]() {
+        Schedule([this]() { ApplyDeviceConfig(); });
+    });
+    ApplyDeviceConfig();
+
     // Start network asynchronously
     board.StartNetwork();
 
@@ -198,12 +206,20 @@ void Application::Run() {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
-            if (GetDeviceState() == kDeviceStateNotifying) {
-                StopNotification();
+            auto state = GetDeviceState();
+            if (silent_ws_reconnect_.exchange(false) &&
+                (state == kDeviceStateIdle || state == kDeviceStateActivating)) {
+                ESP_LOGW(TAG, "Suppressed silent reconnect error: %s",
+                         last_error_message_.c_str());
+                last_error_message_.clear();
+            } else {
+                if (state == kDeviceStateNotifying) {
+                    StopNotification();
+                }
+                SetDeviceState(kDeviceStateIdle);
+                Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
+                      Lang::Sounds::OGG_EXCLAMATION);
             }
-            SetDeviceState(kDeviceStateIdle);
-            Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
-                  Lang::Sounds::OGG_EXCLAMATION);
         }
 
         if (bits & MAIN_EVENT_NETWORK_CONNECTED) {
@@ -267,6 +283,12 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
             if (GetDeviceState() == kDeviceStateListening) {
+                const bool voice_detected = audio_service_.IsVoiceDetected();
+                ESP_LOGI(TAG, "Listening VAD -> %s", voice_detected ? "speech" : "silence");
+                if (voice_detected) {
+                    listening_speech_seen_ = true;
+                    listening_silence_ticks_ = 0;
+                }
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
             }
@@ -286,6 +308,57 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
+            if (GetDeviceState() == kDeviceStateListening &&
+                listening_mode_ == kListeningModeAutoStop &&
+                !pending_listening_start_) {
+                listening_elapsed_ticks_++;
+                const bool voice_detected = audio_service_.IsVoiceDetected();
+                if (voice_detected) {
+                    listening_speech_seen_ = true;
+                    listening_silence_ticks_ = 0;
+                } else {
+                    listening_silence_ticks_++;
+                }
+                const auto guard_action = EvaluateListeningGuard(
+                    listening_mode_,
+                    pending_listening_start_,
+                    voice_detected,
+                    listening_elapsed_ticks_,
+                    listening_silence_ticks_,
+                    listening_speech_seen_);
+                if (guard_action != ListeningGuardAction::kContinue) {
+                    ESP_LOGI(TAG,
+                             "Listening guard stop (reason=%d, elapsed=%ds, silence=%ds, speech_seen=%d)",
+                             static_cast<int>(guard_action),
+                             listening_elapsed_ticks_,
+                             listening_silence_ticks_,
+                             listening_speech_seen_ ? 1 : 0);
+                    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                        protocol_->SendStopListening();
+                    }
+                    SetDeviceState(kDeviceStateIdle);
+                }
+            }
+
+#ifdef CONFIG_BOX2_PERSISTENT_WS
+            if (network_connected_ && GetDeviceState() == kDeviceStateIdle && protocol_ &&
+                !protocol_->IsAudioChannelOpened() &&
+                (clock_ticks_ - last_ws_reconnect_tick_ >= 10) &&
+                !ws_reconnect_running_.exchange(true)) {
+                last_ws_reconnect_tick_ = clock_ticks_;
+                if (xTaskCreate(
+                        [](void* arg) {
+                            auto* app = static_cast<Application*>(arg);
+                            app->StartPersistentProtocolChannel();
+                            app->ws_reconnect_running_ = false;
+                            vTaskDelete(nullptr);
+                        },
+                        "ws_reconnect", 4096 * 2, this, 2, nullptr) != pdPASS) {
+                    ws_reconnect_running_ = false;
+                }
+            }
+#endif
+
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
@@ -302,6 +375,7 @@ void Application::Run() {
 
 void Application::HandleNetworkConnectedEvent() {
     ESP_LOGI(TAG, "Network connected");
+    network_connected_ = true;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateStarting || state == kDeviceStateWifiConfiguring) {
@@ -328,6 +402,7 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    network_connected_ = false;
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -383,18 +458,128 @@ void Application::HandleActivationDoneEvent() {
 void Application::ActivationTask() {
     // Create OTA object for activation process
     ota_ = std::make_unique<Ota>();
+    auto cfg = DeviceConfig::GetInstance().Snapshot();
 
-    // Check for new assets version
-    CheckAssetsVersion();
+    bool fast_boot = false;
+#ifdef CONFIG_BOX2_SKIP_BOOT_OTA
+    if (cfg.skip_boot_ota && ota_->HasCachedWebsocketConfig()) {
+        fast_boot = true;
+    }
+#endif
 
-    // Check for new firmware version
-    CheckNewVersion();
+    if (fast_boot) {
+        ESP_LOGI(TAG, "Fast-boot: using cached websocket config");
+        CheckAssetsVersion();
+        ota_->MarkCurrentVersionValid();
+        InitializeProtocol();
+#ifdef CONFIG_BOX2_PERSISTENT_WS
+        StartPersistentProtocolChannel();
+#endif
+        StartAsyncOtaRefresh();
+    } else {
+        // Check for new assets version
+        CheckAssetsVersion();
 
-    // Initialize the protocol
-    InitializeProtocol();
+        // Check for new firmware version / bootstrap OTA config
+        CheckNewVersion();
+
+        // Initialize the protocol
+        InitializeProtocol();
+#ifdef CONFIG_BOX2_PERSISTENT_WS
+        StartPersistentProtocolChannel();
+#endif
+    }
 
     // Signal completion to main loop
     xEventGroupSetBits(event_group_, MAIN_EVENT_ACTIVATION_DONE);
+}
+
+void Application::ApplyDeviceConfig() {
+    auto cfg = DeviceConfig::GetInstance().Snapshot();
+    auto& board = Board::GetInstance();
+    if (auto backlight = board.GetBacklight()) {
+        backlight->SetBrightness(static_cast<uint8_t>(cfg.brightness), true);
+    }
+    if (auto codec = board.GetAudioCodec()) {
+        codec->SetOutputVolume(cfg.volume);
+    }
+#ifdef HAVE_LVGL
+    if (auto display = board.GetDisplay()) {
+        if (display->GetTheme() != nullptr) {
+            auto theme = LvglThemeManager::GetInstance().GetTheme(cfg.theme);
+            if (theme != nullptr) {
+                display->SetTheme(theme);
+            }
+        }
+    }
+#endif
+    if (GetDeviceState() != kDeviceStateStarting) {
+        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    }
+}
+
+void Application::StartPersistentProtocolChannel() {
+    if (!network_connected_ || !protocol_) {
+        return;
+    }
+    auto state = GetDeviceState();
+    if (state != kDeviceStateIdle && state != kDeviceStateActivating) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(protocol_open_mutex_);
+    if (protocol_->IsAudioChannelOpened()) {
+        return;
+    }
+    silent_ws_reconnect_ = true;
+    if (protocol_->OpenAudioChannel()) {
+        silent_ws_reconnect_ = false;
+        ESP_LOGI(TAG, "Persistent audio channel connected");
+    } else {
+        ESP_LOGW(TAG, "Persistent audio channel connect failed (will retry in background)");
+    }
+}
+
+void Application::StartAsyncOtaRefresh() {
+    if (!network_connected_ || ota_refresh_running_.exchange(true)) {
+        return;
+    }
+    if (xTaskCreate(
+            [](void* arg) {
+                auto* app = static_cast<Application*>(arg);
+                std::string old_url;
+                std::string old_token;
+                {
+                    Settings ws("websocket", false);
+                    old_url = ws.GetString("url");
+                    old_token = ws.GetString("token");
+                }
+                auto bg_ota = std::make_unique<Ota>();
+                auto check = bg_ota->CheckVersion();
+                if (!check) {
+                    ESP_LOGW(TAG, "Background OTA refresh failed: %s", check.error().Message());
+                } else {
+                    std::string new_url;
+                    std::string new_token;
+                    {
+                        Settings ws("websocket", false);
+                        new_url = ws.GetString("url");
+                        new_token = ws.GetString("token");
+                    }
+                    if (new_url != old_url || new_token != old_token) {
+                        ESP_LOGI(TAG, "Websocket config updated by background OTA refresh");
+                        app->Schedule([app]() {
+                            if (app->protocol_ && app->GetDeviceState() == kDeviceStateIdle) {
+                                app->protocol_->CloseAudioChannel();
+                            }
+                        });
+                    }
+                }
+                app->ota_refresh_running_ = false;
+                vTaskDelete(nullptr);
+            },
+            "ota_refresh", 4096 * 2, this, 1, nullptr) != pdPASS) {
+        ota_refresh_running_ = false;
+    }
 }
 
 void Application::CheckAssetsVersion() {
@@ -468,14 +653,27 @@ void Application::CheckNewVersion() {
     const int MAX_RETRY = 10;
     int retry_count = 0;
     int retry_delay = 10;  // Initial retry delay in seconds
+    const bool skip_ota_ui = DeviceConfig::GetInstance().Snapshot().skip_boot_ota;
 
     auto& board = Board::GetInstance();
     while (true) {
         auto display = board.GetDisplay();
-        display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+        if (!skip_ota_ui) {
+            display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
+        }
 
         auto check = ota_->CheckVersion();
         if (!check) {
+            if (skip_ota_ui) {
+                retry_count++;
+                ESP_LOGW(TAG, "OTA config fetch failed (%d/2): %s", retry_count,
+                         check.error().Message());
+                if (ota_->HasCachedWebsocketConfig() || retry_count >= 2) {
+                    return;
+                }
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
             retry_count++;
             if (retry_count >= MAX_RETRY) {
                 ESP_LOGE(TAG, "Too many retries, exit version check");
@@ -515,7 +713,7 @@ void Application::CheckNewVersion() {
         retry_count = 0;
         retry_delay = 10;  // Reset retry delay
 
-        if (ota_->HasNewVersion()) {
+        if (!skip_ota_ui && ota_->HasNewVersion()) {
             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
                 return;  // This line will never be reached after reboot
             }
@@ -562,7 +760,7 @@ void Application::InitializeProtocol() {
 
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota_->HasWebsocketConfig()) {
+    } else if (ota_->HasWebsocketConfig() || ota_->HasCachedWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
@@ -583,7 +781,9 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        if (GetDeviceState() != kDeviceStateIdle && GetDeviceState() != kDeviceStateActivating) {
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+        }
         if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
             ESP_LOGW(TAG,
                      "Server sample rate %d does not match device output sample rate %d, "
@@ -595,9 +795,11 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
-            auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+            if (GetDeviceState() != kDeviceStateIdle) {
+                auto display = Board::GetInstance().GetDisplay();
+                display->SetChatMessage("system", "");
+                SetDeviceState(kDeviceStateIdle);
+            }
         });
     });
 
@@ -722,6 +924,14 @@ void Application::InitializeProtocol() {
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
                 Alert(status->valuestring, message->valuestring, emotion->valuestring,
                       Lang::Sounds::OGG_VIBRATION);
+                if (strcmp(status->valuestring, "待机") == 0) {
+                    Schedule([this]() {
+                        if (GetDeviceState() == kDeviceStateListening &&
+                            listening_mode_ == kListeningModeAutoStop) {
+                            SetDeviceState(kDeviceStateIdle);
+                        }
+                    });
+                }
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -742,6 +952,33 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "listen") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (cJSON_IsString(state) && strcmp(state->valuestring, "stop") == 0) {
+                Schedule([this]() {
+                    if (GetDeviceState() == kDeviceStateListening) {
+                        SetDeviceState(kDeviceStateIdle);
+                    }
+                });
+            }
+        } else if (strcmp(type->valuestring, "config") == 0) {
+            const cJSON* config_obj = cJSON_GetObjectItem(root, "config");
+            if (!cJSON_IsObject(config_obj)) {
+                config_obj = root;
+            }
+            auto cfg_ver = cJSON_GetObjectItem(root, "version");
+            if (!cJSON_IsNumber(cfg_ver)) {
+                cfg_ver = cJSON_GetObjectItem(root, "config_version");
+            }
+            int version = cJSON_IsNumber(cfg_ver) ? cfg_ver->valueint : -1;
+            DeviceConfig::GetInstance().ApplyJson(config_obj, version);
+            if (version >= 0) {
+                Schedule([this, version]() {
+                    if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                        protocol_->SendConfigAck(version);
+                    }
+                });
+            }
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
@@ -777,6 +1014,7 @@ void Application::ShowActivationCode(const std::string& code, const std::string&
 void Application::Alert(const char* status, const char* message, const char* emotion,
                         const std::string_view& sound) {
     ESP_LOGW(TAG, "Alert [%s] %s: %s", emotion, status, message);
+    Board::GetInstance().SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     auto display = Board::GetInstance().GetDisplay();
     display->SetStatus(status);
     display->SetEmotion(emotion);
@@ -840,7 +1078,14 @@ void Application::HandleToggleChatEvent() {
     } else if (state == kDeviceStateSpeaking) {
         AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateListening) {
+#ifdef CONFIG_BOX2_PERSISTENT_WS
+        if (protocol_->IsAudioChannelOpened()) {
+            protocol_->SendStopListening();
+        }
+        SetDeviceState(kDeviceStateIdle);
+#else
         protocol_->CloseAudioChannel();
+#endif
     }
 }
 
@@ -854,13 +1099,17 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            // Return to idle so the device is not stuck in the connecting
-            // state (not every failure path reports a network error)
-            pending_stop_listening_ = false;
-            SetDeviceState(kDeviceStateIdle);
-            return;
+    {
+        std::lock_guard<std::mutex> lock(protocol_open_mutex_);
+        if (!protocol_->IsAudioChannelOpened()) {
+            silent_ws_reconnect_ = false;
+            if (!protocol_->OpenAudioChannel()) {
+                // Return to idle so the device is not stuck in the connecting
+                // state (not every failure path reports a network error)
+                pending_stop_listening_ = false;
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
         }
     }
 
@@ -948,22 +1197,21 @@ void Application::HandleWakeWordDetectedEvent() {
         StopNotification();
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        if (state == kDeviceStateSpeaking &&
+            !DeviceConfig::GetInstance().Snapshot().wake_barge_in) {
+            ESP_LOGI(TAG, "Wake word ignored during speaking (wake_barge_in=false)");
+            audio_service_.EnableWakeWordDetection(true);
+            return;
+        }
+        if (state == kDeviceStateListening) {
+            audio_service_.EnableVoiceProcessing(false);
+        }
         AbortSpeaking(kAbortReasonWakeWordDetected);
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue())
             ;
-
-        if (state == kDeviceStateListening) {
-            protocol_->SendStartListening(GetDefaultListeningMode());
-            audio_service_.ResetDecoder();
-            audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
-            // Re-enable wake word detection as it was stopped by the detection itself
-            audio_service_.EnableWakeWordDetection(true);
-        } else {
-            // Play popup sound and start listening again
-            play_popup_on_listening_ = true;
-            SetListeningMode(GetDefaultListeningMode());
-        }
+        SetDeviceState(kDeviceStateIdle);
+        BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateActivating) {
         // Restart the activation check if the wake word is detected during activation
         SetDeviceState(kDeviceStateIdle);
@@ -1004,13 +1252,17 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
 
-    if (!protocol_->IsAudioChannelOpened()) {
-        if (!protocol_->OpenAudioChannel()) {
-            // Return to idle so the device is not stuck in the connecting
-            // state (not every failure path reports a network error), and
-            // wake word detection is re-enabled by the idle state handler.
-            SetDeviceState(kDeviceStateIdle);
-            return;
+    {
+        std::lock_guard<std::mutex> lock(protocol_open_mutex_);
+        if (!protocol_->IsAudioChannelOpened()) {
+            silent_ws_reconnect_ = false;
+            if (!protocol_->OpenAudioChannel()) {
+                // Return to idle so the device is not stuck in the connecting
+                // state (not every failure path reports a network error), and
+                // wake word detection is re-enabled by the idle state handler.
+                SetDeviceState(kDeviceStateIdle);
+                return;
+            }
         }
     }
 
@@ -1034,6 +1286,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
     clock_ticks_ = 0;
+    last_ws_reconnect_tick_ = -10;
+    listening_elapsed_ticks_ = 0;
+    listening_silence_ticks_ = 0;
+    listening_speech_seen_ = false;
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
     pending_listening_start_ = false;
@@ -1046,6 +1302,7 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
             // Keep a just-raised network error visible. SetDeviceState(idle)
             // queues STATE_CHANGED after Alert(), and the idle handler would
             // otherwise wipe the status, emotion, and chat message.
@@ -1059,11 +1316,13 @@ void Application::HandleStateChangedEvent() {
             audio_service_.EnableWakeWordDetection(true);
             break;
         case kDeviceStateConnecting:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             if (listening_mode_ == kListeningModeManualStop) {
                 display->ClearChatMessages();  // Clear previous turn on new manual recording
             }
@@ -1086,6 +1345,7 @@ void Application::HandleStateChangedEvent() {
             }
             break;
         case kDeviceStateSpeaking:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
@@ -1096,6 +1356,7 @@ void Application::HandleStateChangedEvent() {
             audio_service_.ResetDecoder();
             break;
         case kDeviceStateNotifying:
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
             display->SetStatus(Lang::Strings::SPEAKING);
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
@@ -1184,6 +1445,9 @@ void Application::StartListeningAudio() {
     if (GetDeviceState() != kDeviceStateListening) {
         return;
     }
+    listening_elapsed_ticks_ = 0;
+    listening_silence_ticks_ = 0;
+    listening_speech_seen_ = false;
 
     // Send the start listening command
     protocol_->SendStartListening(listening_mode_);
@@ -1196,6 +1460,31 @@ void Application::StartListeningAudio() {
         play_popup_on_listening_ = false;
         audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
     }
+}
+
+Application::ListeningGuardAction Application::EvaluateListeningGuard(
+    ListeningMode mode,
+    bool pending_start,
+    bool voice_detected,
+    int elapsed_ticks,
+    int silence_ticks,
+    bool speech_seen) {
+    if (mode != kListeningModeAutoStop || pending_start) {
+        return ListeningGuardAction::kContinue;
+    }
+    if (elapsed_ticks >= kListeningMaxDurationTicks) {
+        return ListeningGuardAction::kStopMaxDuration;
+    }
+    if (speech_seen) {
+        if (!voice_detected && silence_ticks >= kListeningPostSpeechSilenceTicks) {
+            return ListeningGuardAction::kStopSilenceAfterSpeech;
+        }
+        return ListeningGuardAction::kContinue;
+    }
+    if (!voice_detected && elapsed_ticks >= kListeningNoSpeechTimeoutTicks) {
+        return ListeningGuardAction::kStopNoSpeechTimeout;
+    }
+    return ListeningGuardAction::kContinue;
 }
 
 void Application::ConfigureWakeWordForListening() {
@@ -1297,7 +1586,11 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
-    return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+    if (aec_mode_ == kAecOff) {
+        auto cfg = DeviceConfig::GetInstance().Snapshot();
+        return (cfg.listening_mode == "manual") ? kListeningModeManualStop : kListeningModeAutoStop;
+    }
+    return kListeningModeRealtime;
 }
 
 void Application::Reboot() {
@@ -1401,9 +1694,16 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
         Schedule([this]() { AbortSpeaking(kAbortReasonNone); });
     } else if (state == kDeviceStateListening) {
         Schedule([this]() {
+#ifdef CONFIG_BOX2_PERSISTENT_WS
+            if (protocol_ && protocol_->IsAudioChannelOpened()) {
+                protocol_->SendStopListening();
+            }
+            SetDeviceState(kDeviceStateIdle);
+#else
             if (protocol_) {
                 protocol_->CloseAudioChannel();
             }
+#endif
         });
     }
 }
@@ -1413,9 +1713,11 @@ bool Application::CanEnterSleepMode() {
         return false;
     }
 
+#ifndef CONFIG_BOX2_PERSISTENT_WS
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         return false;
     }
+#endif
 
     if (!audio_service_.IsIdle()) {
         return false;

@@ -111,6 +111,12 @@ struct DebugStatistics {
     uint32_t encode_drop_count = 0;
 };
 
+struct AudioVisualSnapshot {
+    float level = 0.0f;
+    float bands[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    bool active = false;
+};
+
 class AudioService {
 public:
     AudioService();
@@ -124,6 +130,7 @@ public:
     const std::string& GetLastWakeWord() const;
     std::vector<std::string> GetWakeWords() const;
     bool IsVoiceDetected() const { return voice_detected_; }
+    AudioVisualSnapshot GetVisualSnapshot() const;
     bool IsIdle();
     bool IsPlaybackIdle();
     bool IsWakeWordRunning() const {
@@ -212,6 +219,13 @@ private:
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
 
+    static constexpr size_t kOutputVisualSlices = 4;
+    std::atomic<uint64_t> input_visual_packed_{0};
+    std::atomic<int64_t> input_visual_time_us_{0};
+    std::atomic<uint64_t> output_visual_slices_[kOutputVisualSlices]{};
+    std::atomic<int64_t> output_visual_start_us_{0};
+    std::atomic<int32_t> output_visual_slice_us_{15000};
+
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
@@ -221,6 +235,9 @@ private:
     void CheckAndUpdateAudioPowerState();
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
+    void UpdateInputVisualMetrics(const int16_t* pcm, size_t samples, int channels);
+    void UpdateOutputVisualMetrics(const int16_t* pcm, size_t samples, int sample_rate);
+    void ClearOutputVisualMetrics();
 };
 
 #endif

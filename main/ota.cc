@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "device_config.h"
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
@@ -223,6 +224,13 @@ NetworkResult<> Ota::CheckVersion() {
         ESP_LOGW(TAG, "No server_time section found!");
     }
 
+    cJSON *remote_cfg = cJSON_GetObjectItem(root, "config");
+    if (cJSON_IsObject(remote_cfg)) {
+        cJSON *cfg_ver = cJSON_GetObjectItem(root, "config_version");
+        int ver = cJSON_IsNumber(cfg_ver) ? cfg_ver->valueint : -1;
+        DeviceConfig::GetInstance().ApplyJson(remote_cfg, ver, true);
+    }
+
     has_new_version_ = false;
     cJSON *firmware = cJSON_GetObjectItem(root, "firmware");
     if (cJSON_IsObject(firmware)) {
@@ -255,6 +263,13 @@ NetworkResult<> Ota::CheckVersion() {
 
     cJSON_Delete(root);
     return {};
+}
+
+bool Ota::HasCachedWebsocketConfig() const {
+    Settings settings("websocket", false);
+    std::string url = settings.GetString("url");
+    std::string token = settings.GetString("token");
+    return !url.empty() && !token.empty();
 }
 
 void Ota::MarkCurrentVersionValid() {

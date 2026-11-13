@@ -60,6 +60,18 @@ void PowerSaveTimer::OnShutdownRequest(std::function<void()> callback) {
     on_shutdown_request_ = callback;
 }
 
+void PowerSaveTimer::SetTimeouts(int seconds_to_sleep, int seconds_to_shutdown) {
+    if (seconds_to_sleep_ == seconds_to_sleep && seconds_to_shutdown_ == seconds_to_shutdown) {
+        return;
+    }
+    seconds_to_sleep_ = seconds_to_sleep;
+    seconds_to_shutdown_ = seconds_to_shutdown;
+    shutdown_requested_ = false;
+    if (in_sleep_mode_ && (seconds_to_sleep_ == -1 || ticks_ < seconds_to_sleep_)) {
+        WakeUp();
+    }
+}
+
 void PowerSaveTimer::PowerSaveCheck() {
     auto& app = Application::GetInstance();
     if (!in_sleep_mode_ && !app.CanEnterSleepMode()) {

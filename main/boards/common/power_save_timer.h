@@ -20,6 +20,8 @@ public:
     // sleep mode rearms the request. A callback that declines a request must own
     // any retry or explicitly start a new idle cycle; returning does not retry.
     void OnShutdownRequest(std::function<void()> callback);
+    // Update sleep/shutdown timeouts (-1 disables the corresponding stage).
+    void SetTimeouts(int seconds_to_sleep, int seconds_to_shutdown);
     // Reset the idle countdown and shutdown request, and exit sleep mode if active.
     void WakeUp();
 

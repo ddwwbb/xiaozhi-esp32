@@ -1198,6 +1198,31 @@ menu "Camera Configuration"
 
             ATTENTION: If the option CAMERA_SENSOR_SWAP_PIXEL_BYTE_ORDER is available for your sensor, please use that instead.
 
+    config BOX2_SKIP_BOOT_OTA
+        bool "Boot directly into standby using cached WS config and refresh OTA in background"
+        default y if BOARD_TYPE_ATK_DNESP32S3_BOX2_WIFI
+        default n
+        help
+            Skip firmware upgrade checks and blocking OTA retry dialogs on boot when cached
+            WebSocket credentials exist in NVS, while refreshing token and remote config
+            asynchronously in the background.
+
+    config BOX2_PERSISTENT_WS
+        bool "Keep persistent WebSocket connection in standby"
+        default y if BOARD_TYPE_ATK_DNESP32S3_BOX2_WIFI
+        default n
+        help
+            Establish and maintain the WebSocket connection after boot without blocking sleep
+            or dimming in idle state, and auto-reconnect quietly if dropped.
+
+    config BOX2_LOCAL_CONFIG_WEB
+        bool "Enable lightweight LAN HTTP config portal when connected to Wi-Fi"
+        default y if BOARD_TYPE_ATK_DNESP32S3_BOX2_WIFI
+        default n
+        help
+            Start a local HTTP configuration server on port 80 when Wi-Fi station connects so
+            users can inspect and edit idle dim/power-off/listening settings from a browser.
+
     menuconfig XIAOZHI_ENABLE_ROTATE_CAMERA_IMAGE
         bool "Enable Camera Image Rotation"
         default n

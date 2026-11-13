@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -126,6 +127,30 @@ public:
      */
     void ResetProtocol();
 
+    enum class ListeningGuardAction {
+        kContinue,
+        kStopSilenceAfterSpeech,
+        kStopNoSpeechTimeout,
+        kStopMaxDuration,
+    };
+
+    static constexpr int kListeningPostSpeechSilenceTicks = 4;
+    static constexpr int kListeningNoSpeechTimeoutTicks = 10;
+    static constexpr int kListeningMaxDurationTicks = 65;
+
+    /**
+     * Evaluate client-side listening watchdog state for auto-stop mode so the
+     * device cannot remain wedged in kDeviceStateListening when a backend VAD
+     * decision or listen.stop message is delayed or missed.
+     */
+    static ListeningGuardAction EvaluateListeningGuard(
+        ListeningMode mode,
+        bool pending_start,
+        bool voice_detected,
+        int elapsed_ticks,
+        int silence_ticks,
+        bool speech_seen);
+
 private:
     Application();
     ~Application();
@@ -157,7 +182,16 @@ private:
     bool pending_stop_listening_ = false;   // StopListening arrived while connecting (push-to-talk released early)
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
+    int last_ws_reconnect_tick_ = -10;
+    int listening_elapsed_ticks_ = 0;
+    int listening_silence_ticks_ = 0;
+    bool listening_speech_seen_ = false;
     TaskHandle_t activation_task_handle_ = nullptr;
+    std::mutex protocol_open_mutex_;
+    std::atomic<bool> network_connected_{false};
+    std::atomic<bool> ota_refresh_running_{false};
+    std::atomic<bool> ws_reconnect_running_{false};
+    std::atomic<bool> silent_ws_reconnect_{false};
 
 
     // Event handlers
@@ -187,6 +221,9 @@ private:
     void CheckAssetsVersion();
     void CheckNewVersion();
     void InitializeProtocol();
+    void ApplyDeviceConfig();
+    void StartPersistentProtocolChannel();
+    void StartAsyncOtaRefresh();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
     ListeningMode GetDefaultListeningMode() const;

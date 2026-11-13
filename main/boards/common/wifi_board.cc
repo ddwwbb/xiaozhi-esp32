@@ -2,6 +2,7 @@
 
 #include "display.h"
 #include "application.h"
+#include "local_config_server.h"
 #include "system_info.h"
 #include "settings.h"
 #include "assets/lang_config.h"
@@ -125,6 +126,11 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
 #endif
             in_config_mode_ = false;
             ESP_LOGI(TAG, "Connected to WiFi: %s", data.c_str());
+#ifdef CONFIG_BOX2_LOCAL_CONFIG_WEB
+            LocalConfigServer::GetInstance().Start([this]() {
+                Application::GetInstance().Schedule([this]() { EnterWifiConfigMode(); });
+            });
+#endif
             break;
         case NetworkEvent::Scanning:
             ESP_LOGI(TAG, "WiFi scanning");
@@ -134,10 +140,16 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
             break;
         case NetworkEvent::Disconnected:
             ESP_LOGW(TAG, "WiFi disconnected");
+#ifdef CONFIG_BOX2_LOCAL_CONFIG_WEB
+            LocalConfigServer::GetInstance().Stop();
+#endif
             break;
         case NetworkEvent::WifiConfigModeEnter:
             ESP_LOGI(TAG, "WiFi config mode entered");
             in_config_mode_ = true;
+#ifdef CONFIG_BOX2_LOCAL_CONFIG_WEB
+            LocalConfigServer::GetInstance().Stop();
+#endif
             break;
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
@@ -169,6 +181,9 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
 
 void WifiBoard::StartWifiConfigMode() {
     in_config_mode_ = true;
+#ifdef CONFIG_BOX2_LOCAL_CONFIG_WEB
+    LocalConfigServer::GetInstance().Stop();
+#endif
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
 #ifdef CONFIG_USE_HOTSPOT_WIFI_PROVISIONING

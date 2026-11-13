@@ -1,4 +1,5 @@
 #include "lcd_display.h"
+#include "application.h"
 #include "assets/lang_config.h"
 #include "gif/lvgl_gif.h"
 #include "lvgl_theme.h"
@@ -13,10 +14,40 @@
 #include <noto_emoji.h>
 #include <src/misc/cache/lv_cache.h>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
 #include "board.h"
+
+namespace {
+
+size_t NextUtf8Boundary(const std::string& s, size_t pos, int codepoints) {
+    const size_t n = s.size();
+    for (int c = 0; c < codepoints && pos < n; ++c) {
+        ++pos;
+        while (pos < n && (static_cast<uint8_t>(s[pos]) & 0xC0u) == 0x80u) {
+            ++pos;
+        }
+    }
+    return pos;
+}
+
+bool HasPositiveEmotion(const std::string& e) {
+    return e == "happy" || e == "laughing" || e == "funny" || e == "loving" || e == "wink" ||
+           e == "cool" || e == "delicious" || e == "kissy" || e == "confident";
+}
+
+bool HasAlertEmotion(const std::string& e) {
+    return e == "angry" || e == "warning" || e == "cancel" || e == "shocked" || e == "surprised" ||
+           e == "embarrassed";
+}
+
+bool HasCalmEmotion(const std::string& e) {
+    return e == "sad" || e == "crying" || e == "sleepy" || e == "relaxed" || e == "confused";
+}
+
+}  // namespace
 
 #define TAG "LcdDisplay"
 
@@ -178,7 +209,7 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
         .panel_handle = panel_,
         .control_handle = nullptr,
         .buffer_size = static_cast<uint32_t>(width_ * 20),
-        .double_buffer = false,
+        .double_buffer = true,
         .trans_size = 0,
         .hres = static_cast<uint32_t>(width_),
         .vres = static_cast<uint32_t>(height_),
@@ -323,6 +354,11 @@ MipiLcdDisplay::MipiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel
 
 LcdDisplay::~LcdDisplay() {
     SetPreviewImage(nullptr);
+
+    if (anim_timer_ != nullptr) {
+        lv_timer_delete(anim_timer_);
+        anim_timer_ = nullptr;
+    }
 
     // Clean up GIF controller
     if (gif_controller_) {
@@ -911,18 +947,35 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_bg_color(container_, lvgl_theme->background_color(), 0);
     lv_obj_set_style_border_color(container_, lvgl_theme->border_color(), 0);
 
-    /* Bottom layer: emoji_box_ - centered display */
+    /* Bottom layer: emoji_box_ - Fluid Voice Orb stage */
     emoji_box_ = lv_obj_create(screen);
-    lv_obj_set_size(emoji_box_, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(emoji_box_, 164, 164);
     lv_obj_set_style_bg_opa(emoji_box_, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
-    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_scrollbar_mode(emoji_box_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, -4);
+
+    // Fluid Voice Orb: software-rendered liquid sphere on an opaque RGB565 canvas
+    orb_renderer_ = std::make_unique<FluidOrbRenderer>(kOrbCanvasSize);
+    if (orb_renderer_->ok()) {
+        const lv_color_t bg = lvgl_theme->background_color();
+        const uint8_t bg_rgb[3] = {bg.red, bg.green, bg.blue};
+        orb_renderer_->Clear(bg_rgb);
+        orb_canvas_ = lv_canvas_create(emoji_box_);
+        lv_canvas_set_buffer(orb_canvas_, orb_renderer_->pixels(), kOrbCanvasSize,
+                             kOrbCanvasSize, LV_COLOR_FORMAT_RGB565);
+        lv_obj_align(orb_canvas_, LV_ALIGN_CENTER, 0, 0);
+    } else {
+        ESP_LOGE(TAG, "Fluid orb renderer unavailable, orb disabled");
+        orb_renderer_.reset();
+    }
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, MATERIAL_SYMBOLS_ROBOT_2);
+    lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
 
     emoji_image_ = lv_img_create(emoji_box_);
     lv_obj_center(emoji_image_);
@@ -1008,62 +1061,65 @@ void LcdDisplay::SetupUI() {
     lv_label_set_text(status_label_, Lang::Strings::INITIALIZING);
     lv_obj_align(status_label_, LV_ALIGN_CENTER, 0, 0);
 
-#if CONFIG_USE_MULTILINE_CHAT_MESSAGE
-    /* Bottom bar - auto height, grows upward with wrapped text */
-    bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_width(bottom_bar_, LV_HOR_RES);
-    lv_obj_set_height(bottom_bar_, LV_SIZE_CONTENT);
-    lv_obj_set_style_radius(bottom_bar_, 0, 0);
-    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
-    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);
-    lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
-    lv_obj_set_style_pad_all(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_border_width(bottom_bar_, 0, 0);
-    lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+    /* Multiline smooth-scrolling subtitle card (3-4 visible lines) */
+    const lv_coord_t card_w = LV_HOR_RES - 16;
+    const lv_coord_t line_h = text_font->line_height > 0 ? text_font->line_height : 22;
+    const lv_coord_t view_h = line_h * 4 + 4;
+    const lv_coord_t card_h = view_h + 16;
 
-    /* chat_message_label_ placed in bottom_bar_, multiline wrapped display */
-    chat_message_label_ = lv_label_create(bottom_bar_);
-    lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
-    lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
-#else
-    /* Top layer: Bottom bar - fixed height at bottom */
     bottom_bar_ = lv_obj_create(screen);
-    lv_obj_set_size(bottom_bar_, LV_HOR_RES, text_font->line_height + lvgl_theme->spacing(8));
-    lv_obj_set_style_radius(bottom_bar_, 0, 0);
-    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+    lv_obj_set_size(bottom_bar_, card_w, card_h);
+    lv_obj_set_style_radius(bottom_bar_, 12, 0);
+    lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->chat_background_color(), 0);
+    lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_80, 0);
     lv_obj_set_style_text_color(bottom_bar_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_pad_all(bottom_bar_, 0, 0);
-    lv_obj_set_style_pad_left(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_pad_right(bottom_bar_, lvgl_theme->spacing(4), 0);
-    lv_obj_set_style_border_width(bottom_bar_, 0, 0);
+    lv_obj_set_style_border_width(bottom_bar_, 1, 0);
+    lv_obj_set_style_border_color(bottom_bar_, cur_color_bottom_, 0);
+    lv_obj_set_style_border_opa(bottom_bar_, LV_OPA_30, 0);
     lv_obj_set_scrollbar_mode(bottom_bar_, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_layout(bottom_bar_, LV_LAYOUT_NONE, 0);
+    lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, -6);
 
-    /* chat_message_label_ placed in bottom_bar_, single-line horizontal scroll */
-    chat_message_label_ = lv_label_create(bottom_bar_);
+    subtitle_accent_ = lv_obj_create(bottom_bar_);
+    lv_obj_set_size(subtitle_accent_, 4, view_h - 6);
+    lv_obj_set_style_radius(subtitle_accent_, 2, 0);
+    lv_obj_set_style_bg_color(subtitle_accent_, cur_color_bottom_, 0);
+    lv_obj_set_style_bg_opa(subtitle_accent_, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(subtitle_accent_, 0, 0);
+    lv_obj_set_scrollbar_mode(subtitle_accent_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_align(subtitle_accent_, LV_ALIGN_LEFT_MID, 7, 0);
+
+    subtitle_viewport_ = lv_obj_create(bottom_bar_);
+    lv_obj_set_size(subtitle_viewport_, card_w - 24, view_h);
+    lv_obj_set_style_bg_opa(subtitle_viewport_, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(subtitle_viewport_, 0, 0);
+    lv_obj_set_style_pad_all(subtitle_viewport_, 0, 0);
+    lv_obj_set_scrollbar_mode(subtitle_viewport_, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(subtitle_viewport_, LV_DIR_VER);
+    lv_obj_align(subtitle_viewport_, LV_ALIGN_LEFT_MID, 16, 0);
+
+    chat_message_label_ = lv_label_create(subtitle_viewport_);
     lv_label_set_text(chat_message_label_, "");
-    lv_obj_set_width(chat_message_label_, LV_HOR_RES - lvgl_theme->spacing(8));
-    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(chat_message_label_, card_w - 24);
+    lv_label_set_long_mode(chat_message_label_, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
-    lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_pad_all(chat_message_label_, 0, 0);
+    lv_obj_align(chat_message_label_, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    // Start scrolling after a delay (short text won't scroll)
-    static lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_delay(&a, 1000);
-    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-    lv_obj_set_style_anim(chat_message_label_, &a, LV_PART_MAIN);
-    lv_obj_set_style_anim_duration(chat_message_label_, lv_anim_speed_clamped(60, 300, 60000),
-                                   LV_PART_MAIN);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
-#endif
+
+    if (anim_timer_ == nullptr) {
+        anim_timer_ = lv_timer_create(
+            [](lv_timer_t* t) {
+                auto* self = static_cast<LcdDisplay*>(lv_timer_get_user_data(t));
+                if (self != nullptr) {
+                    self->OnAnimationTimer();
+                }
+            },
+            20, this);
+    }
 
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
@@ -1115,6 +1171,16 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
 }
 
+void LcdDisplay::UpdateSubtitleTargetScroll() {
+    if (chat_message_label_ == nullptr || subtitle_viewport_ == nullptr) {
+        return;
+    }
+    lv_obj_update_layout(subtitle_viewport_);
+    lv_coord_t label_h = lv_obj_get_height(chat_message_label_);
+    lv_coord_t view_h = lv_obj_get_height(subtitle_viewport_);
+    target_scroll_y_ = (label_h > view_h) ? static_cast<float>(label_h - view_h) : 0.0f;
+}
+
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (!setup_ui_called_) {
         ESP_LOGW(TAG, "SetChatMessage('%s', '%s') called before SetupUI() - message will be lost!",
@@ -1130,34 +1196,122 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         }
         return;
     }
-    lv_anim_delete(chat_message_label_, nullptr);
-    lv_label_set_text(chat_message_label_, content);
-    // Show bottom_bar_ only when there is content (and subtitle is not globally hidden)
-    if (bottom_bar_ != nullptr) {
-        if (content == nullptr || content[0] == '\0') {
+
+    const std::string new_role = (role != nullptr) ? role : "";
+    const std::string new_text = (content != nullptr) ? content : "";
+
+    if (new_text.empty()) {
+        target_subtitle_text_.clear();
+        displayed_subtitle_text_.clear();
+        subtitle_role_.clear();
+        revealed_bytes_ = 0;
+        smooth_scroll_y_ = 0.0f;
+        target_scroll_y_ = 0.0f;
+        lv_label_set_text(chat_message_label_, "");
+        if (subtitle_viewport_ != nullptr) {
+            lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
+        }
+        if (bottom_bar_ != nullptr) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else if (!hide_subtitle_) {
-            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    // Accent bar color per role
+    if (subtitle_accent_ != nullptr) {
+        lv_color_t accent = lv_color_hex(0x3B82F6);
+        if (new_role == "user") {
+            accent = lv_color_hex(0x10B981);
+        } else if (new_role == "system") {
+            accent = lv_color_hex(0xF59E0B);
+        }
+        lv_obj_set_style_bg_color(subtitle_accent_, accent, 0);
+        if (bottom_bar_ != nullptr) {
+            lv_obj_set_style_border_color(bottom_bar_, accent, 0);
         }
     }
-#if CONFIG_USE_MULTILINE_CHAT_MESSAGE
-    // Re-align bottom_bar_ after text change so it stays anchored to the bottom
-    // as its height adapts to the wrapped content.
-    if (bottom_bar_ != nullptr) {
-        lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+    // Center align short single-line system prompts, left-align conversational turns
+    if (new_role == "system" && new_text.size() <= 36) {
+        lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
+    } else {
+        lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_LEFT, 0);
     }
-#endif
+
+    const bool same_role = (new_role == subtitle_role_);
+    const bool is_prefix_extension =
+        same_role && !target_subtitle_text_.empty() &&
+        new_text.size() >= target_subtitle_text_.size() &&
+        new_text.compare(0, target_subtitle_text_.size(), target_subtitle_text_) == 0;
+
+    subtitle_role_ = new_role;
+    target_subtitle_text_ = new_text;
+
+    if (new_role == "user") {
+        // Streaming ASR interim or final user speech: show immediately and damp-scroll to bottom
+        revealed_bytes_ = target_subtitle_text_.size();
+        if (displayed_subtitle_text_ != target_subtitle_text_) {
+            displayed_subtitle_text_ = target_subtitle_text_;
+            lv_label_set_text(chat_message_label_, displayed_subtitle_text_.c_str());
+        }
+        if (!is_prefix_extension) {
+            smooth_scroll_y_ = 0.0f;
+            if (subtitle_viewport_ != nullptr) {
+                lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
+            }
+        }
+        UpdateSubtitleTargetScroll();
+    } else if (new_role == "assistant") {
+        thinking_hint_active_ = false;
+        if (is_prefix_extension) {
+            // Keep current typewriter progress and smooth scroll anchor
+            UpdateSubtitleTargetScroll();
+        } else {
+            // New sentence: start progressive typewriter reveal from first 2 codepoints
+            smooth_scroll_y_ = 0.0f;
+            target_scroll_y_ = 0.0f;
+            reveal_tick_div_ = 0;
+            if (subtitle_viewport_ != nullptr) {
+                lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
+            }
+            revealed_bytes_ = NextUtf8Boundary(target_subtitle_text_, 0, 2);
+            displayed_subtitle_text_ = target_subtitle_text_.substr(0, revealed_bytes_);
+            lv_label_set_text(chat_message_label_, displayed_subtitle_text_.c_str());
+            UpdateSubtitleTargetScroll();
+        }
+    } else {
+        // System message
+        revealed_bytes_ = target_subtitle_text_.size();
+        displayed_subtitle_text_ = target_subtitle_text_;
+        lv_label_set_text(chat_message_label_, displayed_subtitle_text_.c_str());
+        smooth_scroll_y_ = 0.0f;
+        if (subtitle_viewport_ != nullptr) {
+            lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
+        }
+        UpdateSubtitleTargetScroll();
+    }
+
+    if (bottom_bar_ != nullptr && !hide_subtitle_) {
+        lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void LcdDisplay::RemoveChatMessage(const char* role, const char* content) {
     DisplayLockGuard lock(this);
     if (chat_message_label_ == nullptr || content == nullptr ||
-        strcmp(lv_label_get_text(chat_message_label_), content) != 0) {
+        target_subtitle_text_ != content) {
         return;
     }
-    // The classic layout has one text slot and does not distinguish message roles.
-    lv_anim_delete(chat_message_label_, nullptr);
+    target_subtitle_text_.clear();
+    displayed_subtitle_text_.clear();
+    subtitle_role_.clear();
+    revealed_bytes_ = 0;
+    smooth_scroll_y_ = 0.0f;
+    target_scroll_y_ = 0.0f;
     lv_label_set_text(chat_message_label_, "");
+    if (subtitle_viewport_ != nullptr) {
+        lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
+    }
     if (bottom_bar_ != nullptr) {
         lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1165,9 +1319,17 @@ void LcdDisplay::RemoveChatMessage(const char* role, const char* content) {
 
 void LcdDisplay::ClearChatMessages() {
     DisplayLockGuard lock(this);
-    // In non-wechat mode, just clear the chat message label and hide the bar
+    target_subtitle_text_.clear();
+    displayed_subtitle_text_.clear();
+    subtitle_role_.clear();
+    revealed_bytes_ = 0;
+    smooth_scroll_y_ = 0.0f;
+    target_scroll_y_ = 0.0f;
     if (chat_message_label_ != nullptr) {
         lv_label_set_text(chat_message_label_, "");
+    }
+    if (subtitle_viewport_ != nullptr) {
+        lv_obj_scroll_to_y(subtitle_viewport_, 0, LV_ANIM_OFF);
     }
     if (bottom_bar_ != nullptr) {
         lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
@@ -1180,6 +1342,28 @@ bool LcdDisplay::SetEmotion(const char* emotion) {
         ESP_LOGW(TAG, "SetEmotion('%s') called before SetupUI() - emotion will not be displayed!",
                  emotion);
     }
+#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
+    if (emoji_box_ != nullptr) {
+        DisplayLockGuard lock(this);
+        current_emotion_ = (emotion != nullptr && emotion[0] != '\0') ? emotion : "neutral";
+        if (current_emotion_ == "thinking") {
+            thinking_hint_active_ = true;
+        } else if (current_emotion_ == "neutral") {
+            thinking_hint_active_ = false;
+        }
+        if (gif_controller_) {
+            gif_controller_->Stop();
+            gif_controller_.reset();
+        }
+        if (emoji_label_ != nullptr) {
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return true;
+    }
+#endif
     if (emoji_image_ == nullptr) {
         if (setup_ui_called_) {
             ESP_LOGW(TAG,
@@ -1405,10 +1589,10 @@ void LcdDisplay::SetTheme(Theme* theme) {
         lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     }
 
-    // Update bottom bar background color with 50% opacity
+    // Update bottom bar background color with 80% opacity
     if (bottom_bar_ != nullptr) {
-        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_50, 0);
-        lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->background_color(), 0);
+        lv_obj_set_style_bg_opa(bottom_bar_, LV_OPA_80, 0);
+        lv_obj_set_style_bg_color(bottom_bar_, lvgl_theme->chat_background_color(), 0);
     }
 #endif
 
@@ -1419,6 +1603,19 @@ void LcdDisplay::SetTheme(Theme* theme) {
     Display::SetTheme(lvgl_theme);
 }
 
+void LcdDisplay::SetPowerSaveMode(bool on) {
+    LvglDisplay::SetPowerSaveMode(on);
+    DisplayLockGuard lock(this);
+    power_save_mode_ = on;
+    if (anim_timer_ != nullptr) {
+        if (on) {
+            lv_timer_pause(anim_timer_);
+        } else {
+            lv_timer_resume(anim_timer_);
+        }
+    }
+}
+
 void LcdDisplay::SetHideSubtitle(bool hide) {
     DisplayLockGuard lock(this);
     hide_subtitle_ = hide;
@@ -1427,13 +1624,239 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
     if (bottom_bar_ != nullptr) {
         if (hide) {
             lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            // Only show if there is actual content to display
-            const char* text =
-                (chat_message_label_ != nullptr) ? lv_label_get_text(chat_message_label_) : nullptr;
-            if (text != nullptr && text[0] != '\0') {
-                lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
-            }
+        } else if (!target_subtitle_text_.empty()) {
+            lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
         }
     }
+}
+
+void LcdDisplay::OnAnimationTimer() {
+#if !CONFIG_USE_WECHAT_MESSAGE_STYLE
+    if (power_save_mode_ || emoji_box_ == nullptr) {
+        return;
+    }
+
+    auto& app = Application::GetInstance();
+    const DeviceState dev_state = app.GetDeviceState();
+    const AudioVisualSnapshot snap = app.GetAudioService().GetVisualSnapshot();
+
+    enum class OrbMode {
+        kIdle,
+        kListening,
+        kThinking,
+        kSpeaking,
+    };
+
+    if (dev_state == kDeviceStateListening && snap.active && snap.level > 0.14f) {
+        thinking_hint_active_ = false;
+    }
+
+    OrbMode mode = OrbMode::kIdle;
+    if (dev_state == kDeviceStateSpeaking || dev_state == kDeviceStateNotifying) {
+        mode = OrbMode::kSpeaking;
+        thinking_hint_active_ = false;
+    } else if (dev_state == kDeviceStateConnecting || thinking_hint_active_ ||
+               current_emotion_ == "thinking") {
+        mode = OrbMode::kThinking;
+    } else if (dev_state == kDeviceStateListening || dev_state == kDeviceStateAudioTesting) {
+        mode = OrbMode::kListening;
+    } else {
+        mode = OrbMode::kIdle;
+    }
+
+    // Palette per mode: base (deep body), c1/c2 (flowing blobs), c3 (highlight/rim), halo (glow)
+    struct OrbPalette {
+        uint32_t base, c1, c2, c3, halo, accent;
+    };
+    // ChatGPT Voice style: deep blue body with white-cyan clouds
+    OrbPalette pal = {0x1E3A8A, 0x3B82F6, 0x60A5FA, 0xE0F2FE, 0x3B82F6, 0x38BDF8};
+    if (mode == OrbMode::kListening) {
+        // Gemini Live listening: blue -> cyan -> mint
+        pal = {0x0B3B8C, 0x22D3EE, 0x34D399, 0xECFEFF, 0x22D3EE, 0x2DD4BF};
+    } else if (mode == OrbMode::kThinking) {
+        // Thinking: indigo/violet swirl with pink sparks
+        pal = {0x312E81, 0x8B5CF6, 0x3B82F6, 0xF5D0FE, 0x8B5CF6, 0xA78BFA};
+    } else if (mode == OrbMode::kSpeaking) {
+        if (HasPositiveEmotion(current_emotion_)) {
+            pal = {0x9A3412, 0xFB923C, 0xF472B6, 0xFEF3C7, 0xF97316, 0xFBBF24};
+        } else if (HasAlertEmotion(current_emotion_)) {
+            pal = {0x7F1D1D, 0xEF4444, 0xFB7185, 0xFFE4E6, 0xEF4444, 0xFB7185};
+        } else if (HasCalmEmotion(current_emotion_)) {
+            pal = {0x1E1B4B, 0x6366F1, 0x38BDF8, 0xE0E7FF, 0x6366F1, 0x818CF8};
+        } else {
+            // Gemini speaking gradient: blue -> violet -> pink
+            pal = {0x1E40AF, 0x4F8BFF, 0xA78BFA, 0xFCE7F3, 0x6D7CFF, 0x60A5FA};
+        }
+    } else if (HasAlertEmotion(current_emotion_)) {
+        pal = {0x7F1D1D, 0xEF4444, 0xFB7185, 0xFFE4E6, 0xEF4444, 0xFB7185};
+    } else if (HasCalmEmotion(current_emotion_)) {
+        pal = {0x1E1B4B, 0x4F46E5, 0x6366F1, 0xE0E7FF, 0x4F46E5, 0x6366F1};
+    }
+
+    // Smooth cross-fade palette (~15% per 20ms frame)
+    constexpr uint8_t kMix = 38;
+    orb_base_ = lv_color_mix(lv_color_hex(pal.base), orb_base_, kMix);
+    orb_c1_ = lv_color_mix(lv_color_hex(pal.c1), orb_c1_, kMix);
+    orb_c2_ = lv_color_mix(lv_color_hex(pal.c2), orb_c2_, kMix);
+    orb_c3_ = lv_color_mix(lv_color_hex(pal.c3), orb_c3_, kMix);
+    cur_color_halo_ = lv_color_mix(lv_color_hex(pal.halo), cur_color_halo_, kMix);
+    cur_color_bottom_ = lv_color_mix(lv_color_hex(pal.accent), cur_color_bottom_, kMix);
+
+    // Target envelope & 5-band sampling / synthesis
+    float target_level = 0.0f;
+    float target_bands[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (mode == OrbMode::kListening || mode == OrbMode::kSpeaking) {
+        if (snap.active) {
+            target_level = snap.level;
+            for (int i = 0; i < 5; ++i) {
+                target_bands[i] = snap.bands[i];
+            }
+        }
+        if (mode == OrbMode::kSpeaking && target_level < 0.06f) {
+            // Gentle living pulse between words during TTS
+            target_level = 0.06f + 0.03f * std::sin(orb_phase_ * 1.4f);
+            for (int i = 0; i < 5; ++i) {
+                target_bands[i] = std::max(target_bands[i], target_level);
+            }
+        }
+    } else if (mode == OrbMode::kThinking) {
+        target_level = 0.10f + 0.06f * std::sin(orb_phase_ * 1.6f);
+        for (int i = 0; i < 5; ++i) {
+            target_bands[i] = 0.18f + 0.14f * std::sin(orb_phase_ * 2.0f + i * 0.9f);
+        }
+    } else {
+        target_level = 0.0f;
+        for (int i = 0; i < 5; ++i) {
+            target_bands[i] = 0.05f + 0.04f * std::sin(orb_phase_ * 0.7f + i * 1.3f);
+        }
+    }
+
+    // Asymmetric spring filter (fast attack, smooth release)
+    const float alpha_lvl = (target_level > smooth_level_) ? 0.45f : 0.14f;
+    smooth_level_ += (target_level - smooth_level_) * alpha_lvl;
+    for (int i = 0; i < 5; ++i) {
+        const float alpha_b = (target_bands[i] > smooth_bands_[i]) ? 0.42f : 0.12f;
+        smooth_bands_[i] += (target_bands[i] - smooth_bands_[i]) * alpha_b;
+    }
+
+    // Mode-dependent body dynamics, eased so transitions never snap
+    float target_scale = 1.0f;
+    float target_glow = 0.35f;
+    float target_warp = 1.0f;
+    float flow_speed = 0.035f;
+    if (mode == OrbMode::kIdle) {
+        target_scale = 0.94f + 0.03f * std::sin(orb_phase_ * 0.8f);  // slow breathing
+        target_glow = 0.28f;
+        target_warp = 0.7f;
+        flow_speed = 0.022f;
+    } else if (mode == OrbMode::kListening) {
+        target_scale = 1.0f;
+        target_glow = 0.40f + smooth_level_ * 0.55f;
+        target_warp = 1.0f;
+        flow_speed = 0.040f + smooth_level_ * 0.09f;
+    } else if (mode == OrbMode::kThinking) {
+        target_scale = 0.88f + 0.05f * std::sin(orb_phase_ * 1.8f);
+        target_glow = 0.45f;
+        target_warp = 1.6f;
+        flow_speed = 0.095f;  // fast swirl
+    } else {  // speaking
+        target_scale = 1.02f;
+        target_glow = 0.45f + smooth_level_ * 0.55f;
+        target_warp = 1.1f;
+        flow_speed = 0.045f + smooth_level_ * 0.11f;
+    }
+    orb_scale_ += (target_scale - orb_scale_) * 0.10f;
+    orb_glow_ += (target_glow - orb_glow_) * 0.15f;
+    orb_warp_ += (target_warp - orb_warp_) * 0.08f;
+    orb_flow_time_ += flow_speed;
+    if (orb_flow_time_ > 20000.0f) {
+        orb_flow_time_ -= 20000.0f;  // rare (hours); keeps float precision for sin phases
+    }
+    orb_phase_ += 0.05f;
+    if (orb_phase_ > 628.3185f) {
+        orb_phase_ -= 628.3185f;
+    }
+
+    // Smoothly glide Orb stage vertically depending on whether subtitle card is shown
+    const bool subtitle_shown =
+        (bottom_bar_ != nullptr) && !lv_obj_has_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
+    const float target_stage_y = subtitle_shown ? -46.0f : -6.0f;
+    if (std::fabs(target_stage_y - orb_offset_y_) > 0.3f) {
+        orb_offset_y_ += (target_stage_y - orb_offset_y_) * 0.18f;
+        lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, static_cast<lv_coord_t>(orb_offset_y_ + 0.5f));
+    }
+
+    // Render liquid orb (adaptive: drop to 25fps if the frame budget is exceeded)
+    ++orb_frame_counter_;
+    const bool orb_visible = orb_canvas_ != nullptr && orb_renderer_ != nullptr &&
+                             !lv_obj_has_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+    if (orb_visible && (!orb_half_rate_ || (orb_frame_counter_ & 1u) == 0u)) {
+        FluidOrbFrame frame;
+        frame.time = orb_flow_time_;
+        frame.level = smooth_level_;
+        for (int i = 0; i < 5; ++i) {
+            frame.bands[i] = smooth_bands_[i];
+        }
+        frame.radius_scale = orb_scale_;
+        frame.glow = orb_glow_;
+        frame.warp = orb_warp_;
+        auto to_rgb = [](lv_color_t c, uint8_t out[3]) {
+            out[0] = c.red;
+            out[1] = c.green;
+            out[2] = c.blue;
+        };
+        to_rgb(orb_base_, frame.base);
+        to_rgb(orb_c1_, frame.c1);
+        to_rgb(orb_c2_, frame.c2);
+        to_rgb(orb_c3_, frame.c3);
+        to_rgb(cur_color_halo_, frame.glow_color);
+        to_rgb(static_cast<LvglTheme*>(current_theme_)->background_color(), frame.bg);
+
+        const int64_t t0 = esp_timer_get_time();
+        orb_renderer_->Render(frame);
+        orb_render_us_acc_ += static_cast<uint32_t>(esp_timer_get_time() - t0);
+        ++orb_render_frames_;
+        lv_obj_invalidate(orb_canvas_);
+
+        if (orb_render_frames_ >= 250) {
+            const uint32_t avg_us = orb_render_us_acc_ / orb_render_frames_;
+            const bool want_half = avg_us > 9000;
+            if (want_half != orb_half_rate_) {
+                orb_half_rate_ = want_half;
+            }
+            ESP_LOGI(TAG, "Fluid orb render avg %lu us/frame (last field %lu us, compose %lu us) %s",
+                     static_cast<unsigned long>(avg_us),
+                     static_cast<unsigned long>(orb_renderer_->last_field_us()),
+                     static_cast<unsigned long>(orb_renderer_->last_compose_us()),
+                     orb_half_rate_ ? "25fps" : "50fps");
+            orb_render_us_acc_ = 0;
+            orb_render_frames_ = 0;
+        }
+    }
+
+    // Progressive typewriter reveal for assistant subtitles
+    if (chat_message_label_ != nullptr && revealed_bytes_ < target_subtitle_text_.size()) {
+        ++reveal_tick_div_;
+        const size_t remaining = target_subtitle_text_.size() - revealed_bytes_;
+        // ~22 chars/sec normal pace; speed up slightly if backlog is long
+        const bool should_advance = (remaining > 96) || ((reveal_tick_div_ & 1u) == 0u);
+        if (should_advance) {
+            int step_chars = (remaining > 180) ? 2 : 1;
+            revealed_bytes_ = NextUtf8Boundary(target_subtitle_text_, revealed_bytes_, step_chars);
+            displayed_subtitle_text_ = target_subtitle_text_.substr(0, revealed_bytes_);
+            lv_label_set_text(chat_message_label_, displayed_subtitle_text_.c_str());
+            UpdateSubtitleTargetScroll();
+        }
+    }
+
+    // Smooth exponential-damped vertical scrolling for multiline subtitle viewport
+    if (subtitle_viewport_ != nullptr && std::fabs(target_scroll_y_ - smooth_scroll_y_) > 0.4f) {
+        smooth_scroll_y_ += (target_scroll_y_ - smooth_scroll_y_) * 0.22f;
+        if (std::fabs(target_scroll_y_ - smooth_scroll_y_) <= 0.6f) {
+            smooth_scroll_y_ = target_scroll_y_;
+        }
+        lv_obj_scroll_to_y(subtitle_viewport_, static_cast<lv_coord_t>(smooth_scroll_y_ + 0.5f),
+                           LV_ANIM_OFF);
+    }
+#endif
 }

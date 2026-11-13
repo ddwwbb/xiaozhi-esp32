@@ -6,7 +6,14 @@
         {
             "name": "atk-dnesp32s3-box2-wifi",
             "sdkconfig_append": [
-                "CONFIG_OTA_URL=\"https://box.u2m.top/xiaozhi/ota/\""
+                "CONFIG_OTA_URL=\"https://box.u2m.top/xiaozhi/ota/\"",
+                "CONFIG_USE_AUDIO_PROCESSOR=y",
+                "CONFIG_SEND_WAKE_WORD_DATA=y",
+                "CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=y",
+                "CONFIG_BOX2_SKIP_BOOT_OTA=y",
+                "CONFIG_BOX2_PERSISTENT_WS=y",
+                "CONFIG_BOX2_LOCAL_CONFIG_WEB=y",
+                "CONFIG_LV_DEF_REFR_PERIOD=20"
             ]
         }
     ]
